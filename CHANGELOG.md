@@ -3,6 +3,11 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+## [Unreleased]
+
+### Fixed
+* **Android**: a second finger on the map during a feature drag no longer throws a `NullPointerException`. The drag now ends with an `end` event at the last dragged position, as it already did on iOS; before, the `onFeatureDrag` listeners never heard that the drag was over (#1043).
+
 ## [0.27.1](https://github.com/maplibre/flutter-maplibre-gl/compare/v0.27.0...v0.27.1)
 
 ### Fixed
