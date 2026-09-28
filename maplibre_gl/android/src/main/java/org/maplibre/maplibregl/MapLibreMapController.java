@@ -25,6 +25,7 @@ import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.TextureView;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.widget.FrameLayout;
 
 import androidx.annotation.NonNull;
@@ -243,6 +244,12 @@ final class MapLibreMapController
 
   private LatLng dragOrigin;
   private LatLng dragPrevious;
+  // The draggable feature under the finger that came down, until the drag starts or the finger
+  // lifts.
+  private Feature dragCandidate;
+  private LatLng dragCandidateOrigin;
+  // From the start of a drag until the last finger lifts: the map gets none of the gesture.
+  private boolean dragOwnsGesture;
   private MapSnapshotter activeSnapshotter;
 
   private Set<String> interactiveFeatureLayerIds;
@@ -300,6 +307,10 @@ final class MapLibreMapController
     this.lifecycleProvider = lifecycleProvider;
     if (dragEnabled) {
       this.androidGesturesManager = new AndroidGesturesManager(this.mapView.getContext(), false);
+      // Without a threshold any move, even one of zero pixels, turned a tap into a drag.
+      this.androidGesturesManager
+          .getMoveGestureDetector()
+          .setMoveThreshold(ViewConfiguration.get(context).getScaledTouchSlop());
     }
 
     mapViewContainer.addView(mapView);
@@ -548,9 +559,7 @@ final class MapLibreMapController
           new View.OnTouchListener() {
             @Override
             public boolean onTouch(View v, MotionEvent event) {
-              androidGesturesManager.onTouchEvent(event);
-
-              return draggedFeature != null;
+              return onDragTouch(v, event);
             }
           });
     }
@@ -3855,23 +3864,67 @@ final class MapLibreMapController
     return bitmap;
   }
 
-  boolean onMoveBegin(MoveGestureDetector detector) {
-    // onMoveBegin gets called even during a move - move end is also not called unless this function
-    // returns
-    // true at least once. To avoid redundant queries only check for feature if the previous event
-    // was ACTION_DOWN
-    if (detector.getPreviousEvent().getActionMasked() == MotionEvent.ACTION_DOWN
-        && detector.getPointersCount() == 1) {
-      PointF pointf = detector.getFocalPoint();
-      LatLng origin = mapLibreMap.getProjection().fromScreenLocation(pointf);
-      RectF rectF = new RectF(pointf.x - 10, pointf.y - 10, pointf.x + 10, pointf.y + 10);
-      Pair<Feature, String> featureLayerPair = firstFeatureOnLayers(rectF);
-      if (featureLayerPair != null && featureLayerPair.first != null && startDragging(featureLayerPair.first, origin)) {
-        invokeFeatureDrag(pointf, "start");
-        return true;
-      }
+  private boolean onDragTouch(View view, MotionEvent event) {
+    final int action = event.getActionMasked();
+    if (action == MotionEvent.ACTION_DOWN) {
+      dragOwnsGesture = false;
+      rememberDragCandidate(new PointF(event.getX(), event.getY()));
+    } else if (event.getPointerCount() > 1 && !dragOwnsGesture) {
+      // A second finger before the drag started: a pinch, the map's to handle.
+      forgetDragCandidate();
     }
-    return false;
+
+    final boolean ownedBefore = dragOwnsGesture;
+    androidGesturesManager.onTouchEvent(event);
+    if (!ownedBefore && dragOwnsGesture) {
+      // The map saw the finger come down; without a cancel its long press fires in the middle of
+      // the drag, since it never sees the moves.
+      final MotionEvent cancel = MotionEvent.obtain(event);
+      cancel.setAction(MotionEvent.ACTION_CANCEL);
+      view.onTouchEvent(cancel);
+      cancel.recycle();
+    }
+
+    // Once a drag has started the gesture is the drag's until the last finger lifts. Before that,
+    // within the touch slop, a touch on a draggable feature may still be a tap: the map gets the
+    // down and the up, not the tremble in between.
+    final boolean consumed =
+        dragOwnsGesture || (dragCandidate != null && action == MotionEvent.ACTION_MOVE);
+    if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+      dragOwnsGesture = false;
+      forgetDragCandidate();
+    }
+    return consumed;
+  }
+
+  // The feature is looked up where the finger came down, where the user aimed: the move detector
+  // only reports the gesture once the finger has left the touch slop.
+  private void rememberDragCandidate(PointF point) {
+    RectF rectF = new RectF(point.x - 10, point.y - 10, point.x + 10, point.y + 10);
+    Pair<Feature, String> featureLayerPair = firstFeatureOnLayers(rectF);
+    if (featureLayerPair != null
+        && featureLayerPair.first != null
+        && isDraggable(featureLayerPair.first)) {
+      dragCandidate = featureLayerPair.first;
+      dragCandidateOrigin = mapLibreMap.getProjection().fromScreenLocation(point);
+    }
+  }
+
+  private void forgetDragCandidate() {
+    dragCandidate = null;
+    dragCandidateOrigin = null;
+  }
+
+  boolean onMoveBegin(MoveGestureDetector detector) {
+    // Called on every move until it returns true; move end is not called unless it did.
+    if (dragCandidate == null || detector.getPointersCount() != 1) {
+      return false;
+    }
+    startDragging(dragCandidate, dragCandidateOrigin);
+    forgetDragCandidate();
+    dragOwnsGesture = true;
+    invokeFeatureDrag(detector.getFocalPoint(), "start");
+    return true;
   }
 
   private void invokeFeatureDrag(PointF pointf, String eventType) {
@@ -3922,12 +3975,14 @@ final class MapLibreMapController
     stopDragging();
   }
 
+  private static boolean isDraggable(@NonNull Feature feature) {
+    return feature.hasNonNullValueForProperty("draggable")
+        ? feature.getBooleanProperty("draggable")
+        : false;
+  }
+
   boolean startDragging(@NonNull Feature feature, @NonNull LatLng origin) {
-    final boolean draggable =
-        feature.hasNonNullValueForProperty("draggable")
-            ? feature.getBooleanProperty("draggable")
-            : false;
-    if (draggable) {
+    if (isDraggable(feature)) {
       draggedFeature = feature;
       dragPrevious = origin;
       dragOrigin = origin;

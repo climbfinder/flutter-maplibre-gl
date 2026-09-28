@@ -52,6 +52,87 @@ void main() {
     expect(map.drags.last, DragEventType.end);
     expect(map.drags.where((e) => e == DragEventType.end), hasLength(1));
   });
+
+  testWidgets('a tap that trembles by a pixel taps the feature, no drag', (
+    tester,
+  ) async {
+    if (!_onAndroid) return;
+    final map = await _pumpMapWithDraggableCircle(tester);
+
+    final finger = _Finger(tester);
+    await finger.down(map.circleOnScreen);
+    await finger.moveBy(const Offset(1, 0));
+    await finger.up();
+    await _settle();
+
+    expect(map.drags, isEmpty);
+    expect(map.featureTaps, hasLength(1));
+  });
+
+  testWidgets('a drag past the touch slop drags the feature, not the map', (
+    tester,
+  ) async {
+    if (!_onAndroid) return;
+    final map = await _pumpMapWithDraggableCircle(tester);
+    final before = await map.controller.getVisibleRegion();
+
+    final finger = _Finger(tester);
+    await finger.down(map.circleOnScreen);
+    for (var i = 0; i < 10; i++) {
+      await finger.moveBy(const Offset(2, 0));
+    }
+    await finger.up();
+    await _settle();
+
+    expect(await map.controller.getVisibleRegion(), before);
+    expect(map.drags.first, DragEventType.start);
+    expect(map.drags, contains(DragEventType.drag));
+    expect(map.drags.last, DragEventType.end);
+    expect(map.featureTaps, isEmpty);
+  });
+
+  testWidgets('two fingers down on a feature pinch the map, no drag', (
+    tester,
+  ) async {
+    if (!_onAndroid) return;
+    final map = await _pumpMapWithDraggableCircle(tester);
+    final before = await map.controller.getVisibleRegion();
+
+    final first = _Finger(tester);
+    await first.down(map.circleOnScreen);
+    final second = _Finger(tester);
+    await second.down(map.circleOnScreen + const Offset(0, 150));
+    for (var i = 0; i < 10; i++) {
+      await first.moveBy(const Offset(0, -10));
+      await second.moveBy(const Offset(0, 10));
+    }
+    await second.up();
+    await first.up();
+    await _settle();
+
+    expect(map.drags, isEmpty);
+    expect(await map.controller.getVisibleRegion(), isNot(before));
+  });
+
+  testWidgets('a drag longer than a long press does not long-press the map', (
+    tester,
+  ) async {
+    if (!_onAndroid) return;
+    final map = await _pumpMapWithDraggableCircle(tester);
+
+    final finger = _Finger(tester);
+    await finger.down(map.circleOnScreen);
+    // One second of slow dragging, well past the long-press timeout.
+    for (var i = 0; i < 20; i++) {
+      await finger.moveBy(const Offset(4, 0), after: 50);
+    }
+    await finger.up();
+    await _settle();
+
+    expect(map.drags.last, DragEventType.end);
+    expect(map.longClicks, isEmpty);
+    expect(map.clicks, isEmpty);
+  });
 }
 
 /// Waits for the platform view to answer over the method channel.
