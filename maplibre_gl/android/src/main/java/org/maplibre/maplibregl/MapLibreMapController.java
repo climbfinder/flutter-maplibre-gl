@@ -239,6 +239,7 @@ final class MapLibreMapController
   private LocationComponent locationComponent = null;
   private LocationEngineCallback<LocationEngineResult> locationEngineCallback = null;
   private Style style;
+  private final java.util.Map<String, ClimbWallLayer> climbWallLayers = new java.util.HashMap<>();
   private Feature draggedFeature;
   private AndroidGesturesManager androidGesturesManager;
 
@@ -2811,6 +2812,39 @@ final class MapLibreMapController
             result.error("STYLE_NOT_READY", "Style is null or not fully loaded. Has onStyleLoaded() already been invoked?", null);
             break;
           }
+          result.success(null);
+          break;
+        }
+      case "climbWall#set":
+        {
+          if (style == null || !style.isFullyLoaded() || mapLibreMap == null) {
+            result.error(
+                "STYLE_NOT_READY",
+                "Style is null or not fully loaded. Has onStyleLoaded() already been invoked?",
+                null);
+            break;
+          }
+          String layerId = call.argument("layerId");
+          ClimbWallLayer wall = climbWallLayers.get(layerId);
+          // A style reload drops the layer but not our handle to it.
+          if (wall == null || style.getLayer(layerId) == null) {
+            if (wall != null) wall.release();
+            if (style.getLayer(layerId) != null) style.removeLayer(layerId);
+            wall = new ClimbWallLayer(layerId);
+            style.addLayer(wall.layer);
+            climbWallLayers.put(layerId, wall);
+          }
+          wall.update(call.argument("wall"), call.argument("shadow"), call.argument("params"));
+          mapLibreMap.triggerRepaint();
+          result.success(null);
+          break;
+        }
+      case "climbWall#remove":
+        {
+          String layerId = call.argument("layerId");
+          ClimbWallLayer wall = climbWallLayers.remove(layerId);
+          if (style != null && style.isFullyLoaded()) style.removeLayer(layerId);
+          if (wall != null) wall.release();
           result.success(null);
           break;
         }

@@ -53,6 +53,12 @@ android {
     lintOptions {
         disable 'InvalidPackage'
     }
+    // Climbfinder fork: the climb wall's custom layer (src/main/cpp).
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+        }
+    }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_21
         targetCompatibility JavaVersion.VERSION_21
