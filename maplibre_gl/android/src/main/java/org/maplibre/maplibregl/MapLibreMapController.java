@@ -166,6 +166,20 @@ final class MapLibreMapController
    */
   private static final long DEFAULT_TRACKING_TILT_DURATION_MS = 1250;
 
+  /**
+   * Starting to track the user zooms in to {@link #DEFAULT_ZOOM_FOR_USER_TRACKING} from
+   * below this level, the way iOS does (MLNMapView's
+   * {@code MLNMinimumZoomLevelForUserTracking}). Android's location component only pans,
+   * so from a country-wide view the user's dot ends up centred but still tiny.
+   */
+  private static final double MIN_ZOOM_FOR_USER_TRACKING = 10.5;
+
+  /** iOS's {@code MLNDefaultZoomLevelForUserTracking}. */
+  private static final double DEFAULT_ZOOM_FOR_USER_TRACKING = 14.0;
+
+  /** The SDK's {@code TRANSITION_ANIMATION_DURATION_MS}, which is package-private. */
+  private static final long TRACKING_TRANSITION_DURATION_MS = 750;
+
   private final int id;
   private final MethodChannel methodChannel;
   private final MapLibreMapsPlugin.LifecycleProvider lifecycleProvider;
@@ -238,6 +252,12 @@ final class MapLibreMapController
   private MethodChannel.Result mapReadyResult;
   private LocationComponent locationComponent = null;
   private LocationEngineCallback<LocationEngineResult> locationEngineCallback = null;
+
+  /**
+   * Tracking started without a known location, so there was nothing to transition to
+   * and the zoom-in has to wait for the first fix. iOS zooms in on that first fix too.
+   */
+  private boolean zoomInOnFirstTrackingFix = false;
   private Style style;
   private final java.util.Map<String, ClimbWallLayer> climbWallLayers = new java.util.HashMap<>();
   private Feature draggedFeature;
@@ -691,6 +711,17 @@ final class MapLibreMapController
   private void onUserLocationUpdate(Location location) {
     if (location == null) {
       return;
+    }
+
+    if (zoomInOnFirstTrackingFix) {
+      zoomInOnFirstTrackingFix = false;
+      if (locationComponent != null
+          && locationComponent.getCameraMode() != CameraMode.NONE
+          && mapLibreMap.getCameraPosition().zoom < MIN_ZOOM_FOR_USER_TRACKING) {
+        // zoomWhileTracking feeds the tracking animator; a regular camera call would
+        // count as a developer animation and drop the camera mode to NONE.
+        locationComponent.zoomWhileTracking(DEFAULT_ZOOM_FOR_USER_TRACKING);
+      }
     }
 
     final Map<String, Object> userLocation = new HashMap<>(6);
@@ -3222,6 +3253,7 @@ final class MapLibreMapController
   @Override
   public void onCameraTrackingDismissed() {
     this.myLocationTrackingMode = 0;
+    zoomInOnFirstTrackingFix = false;
     methodChannel.invokeMethod("map#onCameraTrackingDismissed", new HashMap<>());
   }
 
@@ -3614,8 +3646,33 @@ final class MapLibreMapController
     }
     this.myLocationTrackingMode = myLocationTrackingMode;
     if (mapLibreMap != null && locationComponent != null) {
-      updateMyLocationTrackingMode();
+      startMyLocationTrackingMode();
     }
+  }
+
+  /**
+   * Applies a tracking mode Dart asked for. Only this path zooms in: the location
+   * component re-applies the mode when it is re-created (style load, map view
+   * recreated after a background destroy), and the user may have zoomed out while
+   * tracking since — that zoom must be kept, as iOS keeps it.
+   */
+  private void startMyLocationTrackingMode() {
+    final boolean startsTracking =
+        myLocationTrackingMode != 0 && locationComponent.getCameraMode() == CameraMode.NONE;
+    zoomInOnFirstTrackingFix = false;
+    if (!startsTracking
+        || mapLibreMap.getCameraPosition().zoom >= MIN_ZOOM_FOR_USER_TRACKING) {
+      updateMyLocationTrackingMode();
+      return;
+    }
+    zoomInOnFirstTrackingFix = locationComponent.getLastKnownLocation() == null;
+    locationComponent.setCameraMode(
+        cameraModeFor(myLocationTrackingMode),
+        TRACKING_TRANSITION_DURATION_MS,
+        DEFAULT_ZOOM_FOR_USER_TRACKING,
+        null,
+        null,
+        null);
   }
 
   @Override
@@ -3814,11 +3871,15 @@ final class MapLibreMapController
   }
 
   private void updateMyLocationTrackingMode() {
+    locationComponent.setCameraMode(cameraModeFor(this.myLocationTrackingMode));
+  }
+
+  private static int cameraModeFor(int myLocationTrackingMode) {
     int[] cameraModes =
         new int[] {
           CameraMode.NONE, CameraMode.TRACKING, CameraMode.TRACKING_COMPASS, CameraMode.TRACKING_GPS
         };
-    locationComponent.setCameraMode(cameraModes[this.myLocationTrackingMode]);
+    return cameraModes[myLocationTrackingMode];
   }
 
   private void updateMyLocationRenderMode() {

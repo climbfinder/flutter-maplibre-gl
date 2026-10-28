@@ -6,6 +6,7 @@ See [Conventional Commits](https://conventionalcommits.org) for commit guideline
 ## [Unreleased]
 
 ### Fixed
+* **Android**: starting `MyLocationTrackingMode.tracking` (or `trackingCompass`/`trackingGps`) from below zoom 10.5 now zooms in to 14 on the way to the user, as iOS does. The location component only panned, so from a country-wide view the user's location ended up centred but still tiny. Without a known location yet, the zoom-in follows the first fix, again like iOS. A mode the component re-applies by itself (style reload, map view recreated) keeps the current zoom.
 * **Android**: a second finger on the map during a feature drag no longer throws a `NullPointerException`. The drag now ends with an `end` event at the last dragged position, as it already did on iOS; before, the `onFeatureDrag` listeners never heard that the drag was over (#1043).
 * **Android**: a tap on a draggable feature no longer drags it. Any move, even of zero pixels, started a drag, so a tap reported `start` and `end` in `onFeatureDrag` and nudged the feature by the finger's tremble. A drag now starts once the finger leaves the touch slop, and the feature is looked up where the finger came down.
 * **Android**: the map no longer long-presses in the middle of a feature drag. The map only saw the finger come down, so `onMapLongClick` fired once the drag outlasted the long-press timeout; it now gets the gesture cancelled when the drag starts.
