@@ -16,6 +16,8 @@ final class ClimbWallLayer {
     System.loadLibrary("climbwall");
   }
 
+  private static final int LABEL_META = 11;
+
   final CustomLayer layer;
   private long state;
 
@@ -33,7 +35,6 @@ final class ClimbWallLayer {
         number(params, "originX"),
         number(params, "originY"),
         number(params, "latitude"),
-        number(params, "invCos"),
         number(params, "exaggeration"),
         number(params, "graphIntervalM"),
         number(params, "totalM"),
@@ -41,6 +42,30 @@ final class ClimbWallLayer {
         (float[]) params.get("halfWidthByZoom"),
         (float[]) params.get("riseByZoom"),
         (float[]) params.get("surfaceColors"));
+    Object tops = params.get("tops");
+    if (tops instanceof float[]) nativeSetTops(state, (float[]) tops, number(params, "maxElevation"));
+    Object labels = params.get("labels");
+    if (labels instanceof java.util.List) setLabels((java.util.List<?>) labels);
+  }
+
+  /** See the app's ClimbWallLabelSprite: an image and where it stands, per label. */
+  private void setLabels(java.util.List<?> labels) {
+    byte[][] images = new byte[labels.size()][];
+    int[] sizes = new int[labels.size() * 2];
+    double[] meta = new double[labels.size() * LABEL_META];
+    for (int i = 0; i < labels.size(); i++) {
+      @SuppressWarnings("unchecked")
+      Map<String, Object> label = (Map<String, Object>) labels.get(i);
+      images[i] = (byte[]) label.get("rgba");
+      sizes[i * 2] = (int) number(label, "width");
+      sizes[i * 2 + 1] = (int) number(label, "height");
+      String[] keys = {
+        "pixelRatio", "anchorX", "anchorY", "pivotY", "halfWidth", "bodyHeight",
+        "x", "y", "elevation", "fraction", "distance"
+      };
+      for (int k = 0; k < keys.length; k++) meta[i * LABEL_META + k] = number(label, keys[k]);
+    }
+    nativeSetLabels(state, images, sizes, meta);
   }
 
   void release() {
@@ -65,7 +90,6 @@ final class ClimbWallLayer {
       double originX,
       double originY,
       double latitude,
-      double invCos,
       double exaggeration,
       double graphIntervalM,
       double totalM,
@@ -73,6 +97,10 @@ final class ClimbWallLayer {
       float[] halfWidthByZoom,
       float[] riseByZoom,
       float[] surfaceColors);
+
+  private static native void nativeSetTops(long state, float[] tops, double maxElevation);
+
+  private static native void nativeSetLabels(long state, Object[] images, int[] sizes, double[] meta);
 
   private static native void nativeReleaseState(long state);
 }

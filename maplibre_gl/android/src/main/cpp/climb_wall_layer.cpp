@@ -11,6 +11,8 @@
 #include <android/log.h>
 #include <jni.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <memory>
 #include <mutex>
@@ -34,7 +36,6 @@ layout(location = 3) in vec3 a_road;     // u, kind, surface
 layout(location = 4) in vec3 a_color;
 uniform mat4 u_matrix;
 uniform float u_halfWidthM;
-uniform float u_invCos;
 uniform float u_exaggeration;
 uniform float u_riseM;
 out vec3 v_color;
@@ -44,7 +45,7 @@ flat out float v_kind;
 flat out float v_surface;
 void main() {
     vec2 p = a_center + a_normal * a_shape.x * u_halfWidthM;
-    float z = a_shape.w * (a_shape.y * u_exaggeration + 1.0 + u_riseM * a_shape.z) * u_invCos;
+    float z = a_shape.w * (a_shape.y * u_exaggeration + 1.0 + u_riseM * a_shape.z);
     gl_Position = u_matrix * vec4(p, z, 1.0);
     v_color = a_color;
     v_across = a_shape.x;
@@ -153,11 +154,209 @@ void main() {
 }
 )";
 
+const GLchar* kLabelVertexShader = R"(#version 300 es
+layout(location = 0) in vec4 a_quad;  // clip x, y, then u, v
+out vec2 v_uv;
+void main() {
+    gl_Position = vec4(a_quad.xy, 0.0, 1.0);
+    v_uv = a_quad.zw;
+}
+)";
+
+const GLchar* kLabelFragmentShader = R"(#version 300 es
+precision mediump float;
+uniform sampler2D u_image;
+in vec2 v_uv;
+out vec4 fragColor;
+void main() {
+    fragColor = texture(u_image, v_uv);
+}
+)";
+
+constexpr int kFloatsPerTop = 7;
+constexpr int kLabelMeta = 11;
+constexpr double kMinWallPx = 8.0;
+constexpr double kOcclusionDepthMargin = 1.004;
+
+/// One label image from the app, standing on the wall's top `distance` meters
+/// along it; see the app's ClimbWallLabelSprite.
+struct Label {
+    std::vector<uint8_t> rgba;
+    int pixelWidth = 0;
+    int pixelHeight = 0;
+    double pixelRatio = 1, anchorX = 0, anchorY = 0, pivotY = 0, halfWidth = 0, bodyHeight = 0;
+    double x = 0, y = 0, elevation = 0, fraction = 0, distance = 0;
+};
+
+struct Placed {
+    size_t index;
+    // Two triangles, x y u v per corner, in clip space.
+    float base[24];
+    float body[24];
+};
+
+struct ScreenPoint {
+    bool ok = false;
+    double x = 0, y = 0, depth = 0;
+};
+
+/// Where this frame's labels go: the app's ClimbWallLabelsPainter (the web's
+/// ClimbWallLabels) ported to run inside the map's own frame. A label hidden
+/// behind the wall is left out; one a nearer label covers shrinks. The iOS
+/// twin is ClimbWallLabelLayout in ClimbWallStyleLayer.swift.
+class LabelLayout {
+public:
+    LabelLayout(const double* matrix, double width, double height, double halfWidthM, double exaggeration,
+                double riseM, double metersPerPx, double maxElevation, const std::vector<float>& tops)
+        : m_(matrix), width_(width), height_(height), halfWidthM_(halfWidthM), exaggeration_(exaggeration),
+          riseM_(riseM), metersPerPx_(metersPerPx), maxElevation_(maxElevation), tops_(tops) {}
+
+    std::vector<Placed> place(const std::vector<Label>& labels) {
+        std::vector<Placed> placed;
+        const double wallTop = maxElevation_ * exaggeration_ + 1 + riseM_;
+        if (wallTop / metersPerPx_ < kMinWallPx) return placed;
+        struct Item { size_t index; ScreenPoint at; double covered; };
+        std::vector<Item> items;
+        for (size_t i = 0; i < labels.size(); i++) {
+            const Label& label = labels[i];
+            const double z = label.elevation * exaggeration_ + 1 + riseM_ * label.fraction;
+            ScreenPoint at = project(label.x, label.y, z);
+            if (!at.ok || at.x < 0 || at.x > width_ || at.y < 0 || at.y > height_) continue;
+            if (corners_.empty()) buildCorners();
+            if (hides(label.distance, at)) continue;
+            items.push_back({i, at, 0});
+        }
+        struct Box { double l, t, r, b; };
+        auto box = [&](const Item& item) {
+            const Label& label = labels[item.index];
+            const double pillBottom = item.at.y - (label.anchorY - label.pivotY);
+            return Box{item.at.x - label.halfWidth, pillBottom - label.bodyHeight, item.at.x + label.halfWidth, pillBottom};
+        };
+        for (auto& item : items) {
+            const Box a = box(item);
+            for (const auto& other : items) {
+                if (&item == &other || other.at.depth > item.at.depth) continue;
+                const Box b = box(other);
+                const double w = std::min(a.r, b.r) - std::max(a.l, b.l);
+                const double h = std::min(a.b, b.b) - std::max(a.t, b.t);
+                if (w <= 0 || h <= 0) continue;
+                const double smaller = std::min(std::max(1.0, (a.r - a.l) * (a.b - a.t)), std::max(1.0, (b.r - b.l) * (b.b - b.t)));
+                item.covered = std::max(item.covered, w * h / smaller);
+            }
+        }
+        std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.at.depth > b.at.depth; });
+        for (const auto& item : items) {
+            const Label& label = labels[item.index];
+            const double shrink = std::min(0.93, 0.93 * std::pow(item.covered, 0.35));
+            const double scale = shrink > 0.02 ? 1 - shrink * 0.75 : 1;
+            const double imageWidth = label.pixelWidth / label.pixelRatio;
+            const double imageHeight = label.pixelHeight / label.pixelRatio;
+            // On whole device pixels, so the text stays as sharp as it was drawn.
+            auto snap = [&](double v) { return std::round(v * label.pixelRatio) / label.pixelRatio; };
+            const double left = snap(item.at.x - label.anchorX);
+            const double top = snap(item.at.y - label.anchorY);
+            const double pivotX = left + label.anchorX;
+            const double pivotY = top + label.pivotY;
+            const double pivotV = label.pivotY / imageHeight;
+            Placed p{item.index, {}, {}};
+            quad(p.base, left, pivotY, left + imageWidth, top + imageHeight, pivotV, 1);
+            quad(p.body, pivotX - label.anchorX * scale, pivotY - label.pivotY * scale,
+                 pivotX + (imageWidth - label.anchorX) * scale, pivotY, 0, pivotV);
+            placed.push_back(p);
+        }
+        return placed;
+    }
+
+private:
+    void quad(float* out, double x0, double y0, double x1, double y1, double v0, double v1) const {
+        const float l = static_cast<float>(x0 / width_ * 2 - 1), r = static_cast<float>(x1 / width_ * 2 - 1);
+        const float t = static_cast<float>(1 - y0 / height_ * 2), b = static_cast<float>(1 - y1 / height_ * 2);
+        const float vt = static_cast<float>(v0), vb = static_cast<float>(v1);
+        const float values[24] = {l, t, 0, vt, r, t, 1, vt, r, b, 1, vb, l, t, 0, vt, r, b, 1, vb, l, b, 0, vb};
+        std::copy(values, values + 24, out);
+    }
+
+    ScreenPoint project(double x, double y, double z) const {
+        const double* m = m_;
+        const double cx = m[0] * x + m[4] * y + m[8] * z + m[12];
+        const double cy = m[1] * x + m[5] * y + m[9] * z + m[13];
+        const double w = m[3] * x + m[7] * y + m[11] * z + m[15];
+        if (w <= 1e-9) return {};
+        return {true, (cx / w + 1) / 2 * width_, (1 - cy / w) / 2 * height_, w};
+    }
+
+    // Per top: the left and right foot, then the left and right top.
+    void buildCorners() {
+        const size_t count = tops_.size() / kFloatsPerTop;
+        corners_.resize(count);
+        for (size_t k = 0; k < count; k++) {
+            const float* t = &tops_[k * kFloatsPerTop];
+            const double nx = t[2] * halfWidthM_, ny = t[3] * halfWidthM_;
+            const double z = t[4] * exaggeration_ + 1 + riseM_ * t[5];
+            corners_[k] = {project(t[0] + nx, t[1] + ny, 0), project(t[0] - nx, t[1] - ny, 0),
+                           project(t[0] + nx, t[1] + ny, z), project(t[0] - nx, t[1] - ny, z)};
+        }
+    }
+
+    // The web's occludedAt: a side or the top of a stretch of wall that isn't
+    // right next to the label stands in front of it.
+    bool hides(double distance, const ScreenPoint& at) const {
+        const int count = static_cast<int>(corners_.size());
+        int near = 0;
+        while (near < count - 2 && tops_[(near + 1) * kFloatsPerTop + 6] <= distance) near++;
+        for (int i = 0; i < count - 1; i++) {
+            if (i >= near - 1 && i <= near + 1) continue;
+            const auto& a = corners_[i];
+            const auto& b = corners_[i + 1];
+            // Most of the wall lies nowhere near the label on screen.
+            double minX = at.x, maxX = at.x, minY = at.y, maxY = at.y;
+            bool isNearer = false;
+            for (const auto* corner : {&a[0], &a[1], &a[2], &a[3], &b[0], &b[1], &b[2], &b[3]}) {
+                if (!corner->ok) continue;
+                minX = std::min(minX, corner->x);
+                maxX = std::max(maxX, corner->x);
+                minY = std::min(minY, corner->y);
+                maxY = std::max(maxY, corner->y);
+                isNearer = isNearer || corner->depth < at.depth;
+            }
+            if (!isNearer || minX == at.x || maxX == at.x || minY == at.y || maxY == at.y) continue;
+            if (quadHides(at, a[0], b[0], b[2], a[2]) || quadHides(at, a[1], b[1], b[3], a[3]) ||
+                quadHides(at, a[2], b[2], b[3], a[3])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool quadHides(const ScreenPoint& at, const ScreenPoint& p, const ScreenPoint& q, const ScreenPoint& r,
+                          const ScreenPoint& t) {
+        return triangleHides(at, p, q, r) || triangleHides(at, p, r, t);
+    }
+
+    static bool triangleHides(const ScreenPoint& at, const ScreenPoint& p, const ScreenPoint& q, const ScreenPoint& r) {
+        if (!p.ok || !q.ok || !r.ok) return false;
+        const double d1 = (q.x - p.x) * (at.y - p.y) - (q.y - p.y) * (at.x - p.x);
+        const double d2 = (r.x - q.x) * (at.y - q.y) - (r.y - q.y) * (at.x - q.x);
+        const double d3 = (p.x - r.x) * (at.y - r.y) - (p.y - r.y) * (at.x - r.x);
+        const bool hasNegative = d1 < 0 || d2 < 0 || d3 < 0;
+        const bool hasPositive = d1 > 0 || d2 > 0 || d3 > 0;
+        if (hasNegative && hasPositive) return false;
+        const double area = d1 + d2 + d3;
+        if (std::abs(area) < 1e-9) return false;
+        const double inverseDepth = (d2 / p.depth + d3 / q.depth + d1 / r.depth) / area;
+        return inverseDepth > kOcclusionDepthMargin / at.depth;
+    }
+
+    const double* m_;
+    double width_, height_, halfWidthM_, exaggeration_, riseM_, metersPerPx_, maxElevation_;
+    const std::vector<float>& tops_;
+    std::vector<std::array<ScreenPoint, 4>> corners_;
+};
+
 struct Params {
     double originX = 0;
     double originY = 0;
     double latitude = 0;
-    double invCos = 1;
     double exaggeration = 1;
     double graphIntervalM = 0;
     double totalM = 0;
@@ -173,6 +372,11 @@ struct State {
     std::vector<float> shadow;
     bool isMeshDirty = false;
     Params params;
+    std::vector<float> tops;
+    double maxElevation = 0;
+    std::vector<Label> labels;
+    // Bumped whenever labels change, so the host remakes its textures.
+    int labelsVersion = 0;
 };
 
 float lookup(const std::vector<float>& table, double zoom, double step) {
@@ -218,7 +422,6 @@ public:
         }
         uMatrix_ = glGetUniformLocation(program_, "u_matrix");
         uHalfWidth_ = glGetUniformLocation(program_, "u_halfWidthM");
-        uInvCos_ = glGetUniformLocation(program_, "u_invCos");
         uExaggeration_ = glGetUniformLocation(program_, "u_exaggeration");
         uRise_ = glGetUniformLocation(program_, "u_riseM");
         uMetersPerPx_ = glGetUniformLocation(program_, "u_metersPerPx");
@@ -240,6 +443,23 @@ public:
             }
         }
         glBindVertexArray(0);
+
+        labelProgram_ = glCreateProgram();
+        labelVertexShader_ = compile(GL_VERTEX_SHADER, kLabelVertexShader);
+        labelFragmentShader_ = compile(GL_FRAGMENT_SHADER, kLabelFragmentShader);
+        glAttachShader(labelProgram_, labelVertexShader_);
+        glAttachShader(labelProgram_, labelFragmentShader_);
+        glLinkProgram(labelProgram_);
+        uLabelImage_ = glGetUniformLocation(labelProgram_, "u_image");
+        glGenVertexArrays(1, &labelVao_);
+        glGenBuffers(1, &labelBuffer_);
+        glBindVertexArray(labelVao_);
+        glBindBuffer(GL_ARRAY_BUFFER, labelBuffer_);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), nullptr);
+        glBindVertexArray(0);
+        labelTextures_.clear();
+        labelsVersion_ = -1;
         // A new context has none of the old buffers.
         std::lock_guard<std::mutex> lock(state_->mutex);
         state_->isMeshDirty = true;
@@ -248,42 +468,44 @@ public:
     void render(const mbgl::style::CustomLayerRenderParameters& parameters) override {
         if (!program_) return;
         Params params;
-        {
-            std::lock_guard<std::mutex> lock(state_->mutex);
-            if (state_->isMeshDirty) {
-                upload(0, state_->shadow, shadowCount_);
-                upload(1, state_->wall, wallCount_);
-                state_->isMeshDirty = false;
-            }
-            params = state_->params;
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (state_->isMeshDirty) {
+            upload(0, state_->shadow, shadowCount_);
+            upload(1, state_->wall, wallCount_);
+            state_->isMeshDirty = false;
         }
+        params = state_->params;
         if (wallCount_ == 0) return;
 
         // In world pixels at this zoom the origin's coordinates run to tens of
         // millions, too many for a float: the matrix takes the mesh from meters
         // around the origin to clip space in doubles, and only then is rounded.
+        // Heights stay in meters: MapLibre's matrix scales z by pixels per meter.
         const double worldSize = kTileSize * std::pow(2.0, parameters.zoom);
         const double scale = worldSize / kEarthCircumferenceM;
         const double tx = params.originX * worldSize;
         const double ty = params.originY * worldSize;
         const auto& p = parameters.projectionMatrix;
-        const double model[16] = {scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, 0, tx, ty, 0, 1};
+        const double model[16] = {scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, 1, 0, tx, ty, 0, 1};
+        double frame[16];
         GLfloat matrix[16];
         for (int col = 0; col < 4; col++) {
             for (int row = 0; row < 4; row++) {
                 double sum = 0;
                 for (int i = 0; i < 4; i++) sum += p[i * 4 + row] * model[col * 4 + i];
+                frame[col * 4 + row] = sum;
                 matrix[col * 4 + row] = static_cast<GLfloat>(sum);
             }
         }
         const double metersPerPx = kEarthCircumferenceM * std::cos(params.latitude * M_PI / 180.0) / worldSize;
 
+        const float halfWidthM = lookup(params.halfWidthByZoom, parameters.zoom, params.zoomStep);
+        const float riseM = lookup(params.riseByZoom, parameters.zoom, params.zoomStep);
         glUseProgram(program_);
         glUniformMatrix4fv(uMatrix_, 1, GL_FALSE, matrix);
-        glUniform1f(uHalfWidth_, lookup(params.halfWidthByZoom, parameters.zoom, params.zoomStep));
-        glUniform1f(uInvCos_, static_cast<float>(params.invCos));
+        glUniform1f(uHalfWidth_, halfWidthM);
         glUniform1f(uExaggeration_, static_cast<float>(params.exaggeration));
-        glUniform1f(uRise_, lookup(params.riseByZoom, parameters.zoom, params.zoomStep));
+        glUniform1f(uRise_, riseM);
         glUniform1f(uMetersPerPx_, static_cast<float>(metersPerPx));
         glUniform1f(uGraphInterval_, static_cast<float>(params.graphIntervalM));
         glUniform1f(uTotal_, static_cast<float>(params.totalM));
@@ -291,27 +513,35 @@ public:
         glDisable(GL_STENCIL_TEST);
         glDisable(GL_CULL_FACE);
 
+        // The map's own layers sit in the far end of the depth range: the wall
+        // keeps to the near half, so it tests only against itself.
+        glDepthRangef(0.0f, 0.5f);
         // The ground shadow first, blended and under everything of the wall.
-        glDisable(GL_DEPTH_TEST);
-        glDepthMask(GL_FALSE);
+        // Where its strips overlap (inside a bend) the first one drawn wins:
+        // all of it lies level on the ground, so the next fails a strict test.
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        glDepthMask(GL_TRUE);
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         glBindVertexArray(vaos_[0]);
         glDrawArrays(GL_TRIANGLES, 0, shadowCount_);
 
-        // The map's own layers sit in the far end of the depth range: the wall
-        // keeps to the near half, so it tests only against itself.
         glDisable(GL_BLEND);
-        glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
-        glDepthMask(GL_TRUE);
-        glDepthRangef(0.0f, 0.5f);
         glBindVertexArray(vaos_[1]);
         glDrawArrays(GL_TRIANGLES, 0, wallCount_);
         glBindVertexArray(0);
+
+        LabelLayout layout(frame, parameters.width, parameters.height, halfWidthM, params.exaggeration, riseM,
+                           metersPerPx, state_->maxElevation, state_->tops);
+        drawLabels(layout.place(state_->labels));
     }
 
-    void contextLost() override { program_ = 0; }
+    void contextLost() override {
+        program_ = 0;
+        labelTextures_.clear();
+    }
 
     void deinitialize() override {
         if (!program_) return;
@@ -320,10 +550,62 @@ public:
         glDeleteProgram(program_);
         glDeleteShader(vertexShader_);
         glDeleteShader(fragmentShader_);
+        if (!labelTextures_.empty()) glDeleteTextures(static_cast<GLsizei>(labelTextures_.size()), labelTextures_.data());
+        labelTextures_.clear();
+        glDeleteBuffers(1, &labelBuffer_);
+        glDeleteVertexArrays(1, &labelVao_);
+        glDeleteProgram(labelProgram_);
+        glDeleteShader(labelVertexShader_);
+        glDeleteShader(labelFragmentShader_);
         program_ = 0;
     }
 
 private:
+    // The labels stand on the wall in this very frame: drawn by the app over
+    // the map, they trailed it by a frame or two. Called with the state locked.
+    void drawLabels(const std::vector<Placed>& placed) {
+        const auto& labels = state_->labels;
+        if (labelsVersion_ != state_->labelsVersion) {
+            if (!labelTextures_.empty()) glDeleteTextures(static_cast<GLsizei>(labelTextures_.size()), labelTextures_.data());
+            labelTextures_.assign(labels.size(), 0);
+            glGenTextures(static_cast<GLsizei>(labelTextures_.size()), labelTextures_.data());
+            glActiveTexture(GL_TEXTURE0);
+            for (size_t i = 0; i < labels.size(); i++) {
+                glBindTexture(GL_TEXTURE_2D, labelTextures_[i]);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, labels[i].pixelWidth, labels[i].pixelHeight, 0, GL_RGBA,
+                             GL_UNSIGNED_BYTE, labels[i].rgba.data());
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            }
+            labelsVersion_ = state_->labelsVersion;
+        }
+        if (placed.empty()) return;
+        glUseProgram(labelProgram_);
+        glUniform1i(uLabelImage_, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        // Every stem under every label, like the web: all the stems' quads,
+        // then all the bodies', in one upload.
+        std::vector<float> quads;
+        quads.reserve(placed.size() * 48);
+        for (const auto& item : placed) quads.insert(quads.end(), item.base, item.base + 24);
+        for (const auto& item : placed) quads.insert(quads.end(), item.body, item.body + 24);
+        glBindVertexArray(labelVao_);
+        glBindBuffer(GL_ARRAY_BUFFER, labelBuffer_);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(quads.size() * sizeof(float)), quads.data(), GL_STREAM_DRAW);
+        for (size_t i = 0; i < placed.size() * 2; i++) {
+            glBindTexture(GL_TEXTURE_2D, labelTextures_[placed[i % placed.size()].index]);
+            glDrawArrays(GL_TRIANGLES, static_cast<GLint>(i * 6), 6);
+        }
+        glBindVertexArray(0);
+    }
+
     void upload(int index, const std::vector<float>& data, GLsizei& count) {
         glBindBuffer(GL_ARRAY_BUFFER, buffers_[index]);
         glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(data.size() * sizeof(float)), data.data(), GL_STATIC_DRAW);
@@ -338,8 +620,13 @@ private:
     GLuint buffers_[2] = {0, 0};
     GLsizei wallCount_ = 0;
     GLsizei shadowCount_ = 0;
-    GLint uMatrix_ = -1, uHalfWidth_ = -1, uInvCos_ = -1, uExaggeration_ = -1, uRise_ = -1;
+    GLint uMatrix_ = -1, uHalfWidth_ = -1, uExaggeration_ = -1, uRise_ = -1;
     GLint uMetersPerPx_ = -1, uGraphInterval_ = -1, uTotal_ = -1, uSurfaceColors_ = -1;
+    GLuint labelProgram_ = 0, labelVertexShader_ = 0, labelFragmentShader_ = 0;
+    GLuint labelVao_ = 0, labelBuffer_ = 0;
+    GLint uLabelImage_ = -1;
+    std::vector<GLuint> labelTextures_;
+    int labelsVersion_ = -1;
 };
 
 std::shared_ptr<State>& handle(jlong state) { return *reinterpret_cast<std::shared_ptr<State>*>(state); }
@@ -378,14 +665,13 @@ JNIEXPORT void JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeSetMesh
 }
 
 JNIEXPORT void JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeSetParams(
-    JNIEnv* env, jclass, jlong state, jdouble originX, jdouble originY, jdouble latitude, jdouble invCos,
+    JNIEnv* env, jclass, jlong state, jdouble originX, jdouble originY, jdouble latitude,
     jdouble exaggeration, jdouble graphIntervalM, jdouble totalM, jdouble zoomStep, jfloatArray halfWidthByZoom,
     jfloatArray riseByZoom, jfloatArray surfaceColors) {
     Params params;
     params.originX = originX;
     params.originY = originY;
     params.latitude = latitude;
-    params.invCos = invCos;
     params.exaggeration = exaggeration;
     params.graphIntervalM = graphIntervalM;
     params.totalM = totalM;
@@ -397,6 +683,57 @@ JNIEXPORT void JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeSetPara
     auto& s = handle(state);
     std::lock_guard<std::mutex> lock(s->mutex);
     s->params = std::move(params);
+}
+
+JNIEXPORT void JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeSetTops(JNIEnv* env, jclass, jlong state,
+                                                                               jfloatArray tops, jdouble maxElevation) {
+    auto values = floats(env, tops);
+    auto& s = handle(state);
+    std::lock_guard<std::mutex> lock(s->mutex);
+    s->tops = std::move(values);
+    s->maxElevation = maxElevation;
+}
+
+JNIEXPORT void JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeSetLabels(JNIEnv* env, jclass, jlong state,
+                                                                                 jobjectArray images, jintArray sizes,
+                                                                                 jdoubleArray meta) {
+    const jsize count = env->GetArrayLength(images);
+    std::vector<jint> sizeValues(static_cast<size_t>(count * 2));
+    env->GetIntArrayRegion(sizes, 0, count * 2, sizeValues.data());
+    std::vector<jdouble> metaValues(static_cast<size_t>(count * kLabelMeta));
+    env->GetDoubleArrayRegion(meta, 0, count * kLabelMeta, metaValues.data());
+    std::vector<Label> labels;
+    for (jsize i = 0; i < count; i++) {
+        auto image = static_cast<jbyteArray>(env->GetObjectArrayElement(images, i));
+        Label label;
+        label.pixelWidth = sizeValues[i * 2];
+        label.pixelHeight = sizeValues[i * 2 + 1];
+        const jsize length = image ? env->GetArrayLength(image) : 0;
+        if (length != label.pixelWidth * label.pixelHeight * 4) {
+            if (image) env->DeleteLocalRef(image);
+            continue;
+        }
+        label.rgba.resize(static_cast<size_t>(length));
+        env->GetByteArrayRegion(image, 0, length, reinterpret_cast<jbyte*>(label.rgba.data()));
+        env->DeleteLocalRef(image);
+        const jdouble* m = &metaValues[i * kLabelMeta];
+        label.pixelRatio = m[0];
+        label.anchorX = m[1];
+        label.anchorY = m[2];
+        label.pivotY = m[3];
+        label.halfWidth = m[4];
+        label.bodyHeight = m[5];
+        label.x = m[6];
+        label.y = m[7];
+        label.elevation = m[8];
+        label.fraction = m[9];
+        label.distance = m[10];
+        labels.push_back(std::move(label));
+    }
+    auto& s = handle(state);
+    std::lock_guard<std::mutex> lock(s->mutex);
+    s->labels = std::move(labels);
+    s->labelsVersion++;
 }
 
 JNIEXPORT void JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeReleaseState(JNIEnv*, jclass, jlong state) {
