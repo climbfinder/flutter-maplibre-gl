@@ -43,6 +43,7 @@ out float v_across;
 out float v_u;
 flat out float v_kind;
 flat out float v_surface;
+out vec3 v_world;
 void main() {
     vec2 p = a_center + a_normal * a_shape.x * u_halfWidthM;
     float z = a_shape.w * (a_shape.y * u_exaggeration + 1.0 + u_riseM * a_shape.z);
@@ -52,6 +53,7 @@ void main() {
     v_u = a_road.x;
     v_kind = a_road.y;
     v_surface = a_road.z;
+    v_world = vec3(p, z);
 }
 )";
 
@@ -68,7 +70,29 @@ in float v_across;
 in float v_u;
 flat in float v_kind;
 flat in float v_surface;
+in vec3 v_world;
 out vec4 fragColor;
+
+// How much of this pixel lies past `edge` along `x`, which changes by `w` per
+// pixel: a soft step one pixel wide, so the details painted on the wall don't
+// stair-step.
+float coverage(float x, float edge, float w) {
+    return clamp((x - edge) / max(w, 1e-6) + 0.5, 0.0, 1.0);
+}
+
+// The road's top lit by a low sun from the north-west (mercator y points
+// south): stretches that climb towards it brighten, those that turn away
+// darken, flat road stays as it was.
+vec3 lit(vec3 c, vec3 world) {
+    vec3 n = cross(dFdx(world), dFdy(world));
+    float len = length(n);
+    if (len < 1e-12) return c;
+    n /= len;
+    if (n.z < 0.0) n = -n;
+    vec3 sun = normalize(vec3(-0.6, -0.6, 1.0));
+    float shade = clamp(dot(n, sun) / sun.z, 0.7, 1.2);
+    return min(c * mix(1.0, shade, 0.6), vec3(1.0));
+}
 
 float hash(int x, int y, int salt) {
     uint h = uint(x) * 374761393u + uint(y) * 668265263u + uint(salt) * 1442695041u;
@@ -125,32 +149,51 @@ void main() {
     float hw = u_halfWidthM;
     float mpp = u_metersPerPx;
     int kind = int(v_kind + 0.5);
-    if (kind == 3) {
-        float t = clamp((abs(v_across) / 5.0 - 0.2) / 0.8, 0.0, 1.0);
-        float alpha = 0.4 * (1.0 - t * t * (3.0 - 2.0 * t));
-        fragColor = vec4(0.0, 0.0, 0.0, alpha);
-        return;
-    }
     if (kind == 0) {
         vec3 c = v_color;
         if (u_graphIntervalM > 0.0) {
             float k = floor(v_u / u_graphIntervalM + 0.5);
             float stripe = k * u_graphIntervalM;
-            if (k > 0.0 && stripe < u_totalM && abs(v_u - stripe) < mpp) c = mix(c, vec3(1.0), 0.6);
+            if (k > 0.0 && stripe < u_totalM) c = mix(c, vec3(1.0), 0.6 * coverage(-abs(v_u - stripe), -mpp, fwidth(v_u)));
         }
         fragColor = vec4(c, 1.0);
         return;
     }
     float a = abs(v_across);
-    if (hw * 0.22 / mpp >= 0.5 && a > 0.78) {
-        fragColor = vec4(0.078, 0.078, 0.078, 1.0);
-        return;
-    }
+    float wa = fwidth(a);
     int surface = int(v_surface + 0.5);
     vec3 c = road(surface, v_u, v_across * hw + hw, hw, mpp);
     bool isDashed = kind == 1 && (surface == 0 || surface == 2) && hw * 0.22 / mpp >= 0.5;
-    if (isDashed && a < 0.11 && mod(v_u, 4.0 * hw) < 2.0 * hw) c = vec3(0.969);
-    fragColor = vec4(c, 1.0);
+    if (isDashed) {
+        // Measured along the road itself: the phase jumps at every dash.
+        float wu = fwidth(v_u);
+        float phase = mod(v_u, 4.0 * hw);
+        float along = max(coverage(min(phase, 2.0 * hw - phase), 0.0, wu), coverage(phase, 4.0 * hw, wu));
+        c = mix(c, vec3(0.969), along * (1.0 - coverage(a, 0.11, wa)));
+    }
+    if (hw * 0.22 / mpp >= 0.5) c = mix(c, vec3(0.078), coverage(a, 0.78, wa));
+    fragColor = vec4(lit(c, v_world), 1.0);
+}
+)";
+
+// Where the shadow's strips overlap (inside a bend) each pixel must be shaded
+// once, by the darkest strip. Their interpolated depths differ by rounding,
+// so the depth comes from the ground plane under the pixel instead, the same
+// for every strip, nudged nearer by the quantized darkness: a first pass
+// keeps the darkest per pixel in the depth buffer, a second draws only that.
+const GLchar* kShadowFragmentShader = R"(#version 300 es
+precision highp float;
+uniform vec3 u_groundDepth;
+uniform float u_depthStep;
+uniform float u_depthNudge;
+in float v_across;
+out vec4 fragColor;
+void main() {
+    float t = clamp((abs(v_across) / 5.0 - 0.2) / 0.8, 0.0, 1.0);
+    float alpha = 0.4 * (1.0 - t * t * (3.0 - 2.0 * t));
+    float level = floor(alpha * 64.0 + 0.5);
+    gl_FragDepth = dot(u_groundDepth, vec3(gl_FragCoord.xy, 1.0)) - level * u_depthStep - u_depthNudge;
+    fragColor = vec4(0.0, 0.0, 0.0, alpha);
 }
 )";
 
@@ -402,6 +445,34 @@ GLuint compile(GLenum type, const GLchar* source) {
     return shader;
 }
 
+// The window depth of the ground (z = 0) as a plane over the framebuffer's
+// pixels, depth = a·x + b·y + c, in the wall's near half of the depth range.
+void groundDepth(const double* m, const GLint* viewport, GLfloat* out) {
+    // Clip x, y, w of a ground point are A·(x, y, 1); its NDC z is then
+    // linear in NDC x, y, with the coefficients rowZ · A⁻¹.
+    const double a[9] = {m[0], m[4], m[12], m[1], m[5], m[13], m[3], m[7], m[15]};
+    const double rowZ[3] = {m[2], m[6], m[14]};
+    const double det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) +
+                       a[2] * (a[3] * a[7] - a[4] * a[6]);
+    if (std::abs(det) < 1e-30) {
+        out[0] = out[1] = 0;
+        out[2] = 0.5f;
+        return;
+    }
+    const double inv[9] = {
+        (a[4] * a[8] - a[5] * a[7]) / det, (a[2] * a[7] - a[1] * a[8]) / det, (a[1] * a[5] - a[2] * a[4]) / det,
+        (a[5] * a[6] - a[3] * a[8]) / det, (a[0] * a[8] - a[2] * a[6]) / det, (a[2] * a[3] - a[0] * a[5]) / det,
+        (a[3] * a[7] - a[4] * a[6]) / det, (a[1] * a[6] - a[0] * a[7]) / det, (a[0] * a[4] - a[1] * a[3]) / det,
+    };
+    double c[3];
+    for (int j = 0; j < 3; j++) c[j] = rowZ[0] * inv[j] + rowZ[1] * inv[3 + j] + rowZ[2] * inv[6 + j];
+    // NDC from pixels: 2 (x − vx) / w − 1; window depth: NDC z / 4 + 1/4.
+    const double w = viewport[2], h = viewport[3];
+    out[0] = static_cast<GLfloat>(0.5 * c[0] / w);
+    out[1] = static_cast<GLfloat>(0.5 * c[1] / h);
+    out[2] = static_cast<GLfloat>(0.25 * (c[2] - c[0] * (1 + 2 * viewport[0] / w) - c[1] * (1 + 2 * viewport[1] / h)) + 0.25);
+}
+
 class ClimbWallHost final : public mbgl::style::CustomLayerHost {
 public:
     explicit ClimbWallHost(std::shared_ptr<State> state) : state_(std::move(state)) {}
@@ -428,6 +499,22 @@ public:
         uGraphInterval_ = glGetUniformLocation(program_, "u_graphIntervalM");
         uTotal_ = glGetUniformLocation(program_, "u_totalM");
         uSurfaceColors_ = glGetUniformLocation(program_, "u_surfaceColors");
+        shadowProgram_ = glCreateProgram();
+        shadowFragmentShader_ = compile(GL_FRAGMENT_SHADER, kShadowFragmentShader);
+        glAttachShader(shadowProgram_, vertexShader_);
+        glAttachShader(shadowProgram_, shadowFragmentShader_);
+        glLinkProgram(shadowProgram_);
+        uShadowMatrix_ = glGetUniformLocation(shadowProgram_, "u_matrix");
+        uShadowHalfWidth_ = glGetUniformLocation(shadowProgram_, "u_halfWidthM");
+        uShadowExaggeration_ = glGetUniformLocation(shadowProgram_, "u_exaggeration");
+        uShadowRise_ = glGetUniformLocation(shadowProgram_, "u_riseM");
+        uGroundDepth_ = glGetUniformLocation(shadowProgram_, "u_groundDepth");
+        uDepthStep_ = glGetUniformLocation(shadowProgram_, "u_depthStep");
+        uDepthNudge_ = glGetUniformLocation(shadowProgram_, "u_depthNudge");
+        // Steps of whole depth-buffer units, so neighbouring levels never round together.
+        GLint depthBits = 0;
+        glGetIntegerv(GL_DEPTH_BITS, &depthBits);
+        depthUnit_ = static_cast<float>(std::ldexp(1.0, -(depthBits > 0 ? depthBits : 16)));
         glGenVertexArrays(2, vaos_);
         glGenBuffers(2, buffers_);
         for (int i = 0; i < 2; i++) {
@@ -501,6 +588,40 @@ public:
 
         const float halfWidthM = lookup(params.halfWidthByZoom, parameters.zoom, params.zoomStep);
         const float riseM = lookup(params.riseByZoom, parameters.zoom, params.zoomStep);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_CULL_FACE);
+
+        // The map's own layers sit in the far end of the depth range: the wall
+        // keeps to the near half, so it tests only against itself.
+        glDepthRangef(0.0f, 0.5f);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        glDepthMask(GL_TRUE);
+        // The ground shadow first, under everything of the wall: the darkest
+        // strip's depth per pixel, then only that strip's color.
+        if (shadowCount_ > 0) {
+            GLint viewport[4];
+            glGetIntegerv(GL_VIEWPORT, viewport);
+            GLfloat ground[3];
+            groundDepth(frame, viewport, ground);
+            glUseProgram(shadowProgram_);
+            glUniformMatrix4fv(uShadowMatrix_, 1, GL_FALSE, matrix);
+            glUniform1f(uShadowHalfWidth_, halfWidthM);
+            glUniform1f(uShadowExaggeration_, static_cast<float>(params.exaggeration));
+            glUniform1f(uShadowRise_, riseM);
+            glUniform3fv(uGroundDepth_, 1, ground);
+            glUniform1f(uDepthStep_, 4 * depthUnit_);
+            glBindVertexArray(vaos_[0]);
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            glUniform1f(uDepthNudge_, 0);
+            glDrawArrays(GL_TRIANGLES, 0, shadowCount_);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            glUniform1f(uDepthNudge_, 2 * depthUnit_);
+            glDrawArrays(GL_TRIANGLES, 0, shadowCount_);
+        }
+
         glUseProgram(program_);
         glUniformMatrix4fv(uMatrix_, 1, GL_FALSE, matrix);
         glUniform1f(uHalfWidth_, halfWidthM);
@@ -510,23 +631,6 @@ public:
         glUniform1f(uGraphInterval_, static_cast<float>(params.graphIntervalM));
         glUniform1f(uTotal_, static_cast<float>(params.totalM));
         glUniform3fv(uSurfaceColors_, 4, params.surfaceColors.data());
-        glDisable(GL_STENCIL_TEST);
-        glDisable(GL_CULL_FACE);
-
-        // The map's own layers sit in the far end of the depth range: the wall
-        // keeps to the near half, so it tests only against itself.
-        glDepthRangef(0.0f, 0.5f);
-        // The ground shadow first, blended and under everything of the wall.
-        // Where its strips overlap (inside a bend) the first one drawn wins:
-        // all of it lies level on the ground, so the next fails a strict test.
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LESS);
-        glDepthMask(GL_TRUE);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        glBindVertexArray(vaos_[0]);
-        glDrawArrays(GL_TRIANGLES, 0, shadowCount_);
-
         glDisable(GL_BLEND);
         glDepthFunc(GL_LEQUAL);
         glBindVertexArray(vaos_[1]);
@@ -548,6 +652,8 @@ public:
         glDeleteBuffers(2, buffers_);
         glDeleteVertexArrays(2, vaos_);
         glDeleteProgram(program_);
+        glDeleteProgram(shadowProgram_);
+        glDeleteShader(shadowFragmentShader_);
         glDeleteShader(vertexShader_);
         glDeleteShader(fragmentShader_);
         if (!labelTextures_.empty()) glDeleteTextures(static_cast<GLsizei>(labelTextures_.size()), labelTextures_.data());
@@ -622,6 +728,10 @@ private:
     GLsizei shadowCount_ = 0;
     GLint uMatrix_ = -1, uHalfWidth_ = -1, uExaggeration_ = -1, uRise_ = -1;
     GLint uMetersPerPx_ = -1, uGraphInterval_ = -1, uTotal_ = -1, uSurfaceColors_ = -1;
+    GLuint shadowProgram_ = 0, shadowFragmentShader_ = 0;
+    GLint uShadowMatrix_ = -1, uShadowHalfWidth_ = -1, uShadowExaggeration_ = -1, uShadowRise_ = -1;
+    GLint uGroundDepth_ = -1, uDepthStep_ = -1, uDepthNudge_ = -1;
+    float depthUnit_ = 1.0f / 65536.0f;
     GLuint labelProgram_ = 0, labelVertexShader_ = 0, labelFragmentShader_ = 0;
     GLuint labelVao_ = 0, labelBuffer_ = 0;
     GLint uLabelImage_ = -1;

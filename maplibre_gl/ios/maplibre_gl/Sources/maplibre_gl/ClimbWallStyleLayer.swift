@@ -33,9 +33,20 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         var surface3: SIMD4<Float>
     }
 
+    /// See `shadowFragment`.
+    private struct ShadowUniforms {
+        var groundDepth: SIMD4<Float>
+        var depthStep: Float
+        var depthNudge: Float
+        var pad0: Float = 0
+        var pad1: Float = 0
+    }
+
     private var device: MTLDevice?
+    private weak var view: MTKView?
     private var wallPipeline: MTLRenderPipelineState?
     private var shadowPipeline: MTLRenderPipelineState?
+    private var shadowDepthPipeline: MTLRenderPipelineState?
     private var wallDepth: MTLDepthStencilState?
     private var shadowDepth: MTLDepthStencilState?
     private var wallBuffer: MTLBuffer?
@@ -98,6 +109,7 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         let resource = mapView.backendResource()
         guard let device = resource.device, let view = resource.mtkView else { return }
         self.device = device
+        self.view = view
         let library: MTLLibrary
         do {
             library = try device.makeLibrary(source: Self.shaderSource, options: nil)
@@ -106,7 +118,7 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
             return
         }
 
-        func pipeline(fragment: String, isBlended: Bool) -> MTLRenderPipelineState? {
+        func pipeline(fragment: String, isBlended: Bool, writesColor: Bool = true) -> MTLRenderPipelineState? {
             let descriptor = MTLRenderPipelineDescriptor()
             descriptor.vertexFunction = library.makeFunction(name: "wallVertex")
             descriptor.fragmentFunction = library.makeFunction(name: fragment)
@@ -122,6 +134,9 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
                 color.destinationRGBBlendFactor = .oneMinusSourceAlpha
                 color.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             }
+            if !writesColor {
+                descriptor.colorAttachments[0].writeMask = []
+            }
             do {
                 return try device.makeRenderPipelineState(descriptor: descriptor)
             } catch {
@@ -131,6 +146,7 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         }
         wallPipeline = pipeline(fragment: "wallFragment", isBlended: false)
         shadowPipeline = pipeline(fragment: "shadowFragment", isBlended: true)
+        shadowDepthPipeline = pipeline(fragment: "shadowFragment", isBlended: false, writesColor: false)
 
         let labelDescriptor = MTLRenderPipelineDescriptor()
         labelDescriptor.vertexFunction = library.makeFunction(name: "labelVertex")
@@ -154,8 +170,6 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         wallDescriptor.depthCompareFunction = .lessEqual
         wallDescriptor.isDepthWriteEnabled = true
         wallDepth = device.makeDepthStencilState(descriptor: wallDescriptor)
-        // Where the shadow's strips overlap (inside a bend) the first one drawn
-        // wins: all of it lies level on the ground, so the next fails a strict test.
         let shadowDescriptor = MTLDepthStencilDescriptor()
         shadowDescriptor.depthCompareFunction = .less
         shadowDescriptor.isDepthWriteEnabled = true
@@ -171,6 +185,7 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         shadowBuffer = nil
         wallPipeline = nil
         shadowPipeline = nil
+        shadowDepthPipeline = nil
         labelPipeline = nil
         for label in labels {
             label.texture = nil
@@ -179,7 +194,8 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
 
     override func draw(in _: MLNMapView, with context: MLNStyleLayerDrawingContext) {
         guard let encoder = renderEncoder, let device = device,
-              let wallPipeline = wallPipeline, let shadowPipeline = shadowPipeline
+              let wallPipeline = wallPipeline, let shadowPipeline = shadowPipeline,
+              let shadowDepthPipeline = shadowDepthPipeline
         else { return }
         if let wall = pendingWall, let shadow = pendingShadow {
             wallBuffer = wall.isEmpty ? nil : wall.withUnsafeBytes { device.makeBuffer(bytes: $0.baseAddress!, length: wall.count) }
@@ -195,13 +211,24 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         var uniforms = makeUniforms(context, matrix: matrix)
         let length = MemoryLayout<Uniforms>.stride
         encoder.setCullMode(.none)
+        // The ground shadow first, under everything of the wall: the darkest
+        // strip's depth per pixel, then only that strip's color.
         if let shadowBuffer = shadowBuffer, shadowCount > 0 {
-            encoder.setRenderPipelineState(shadowPipeline)
+            let size = view?.drawableSize ?? CGSize(width: context.size.width, height: context.size.height)
+            var shadow = ShadowUniforms(
+                groundDepth: Self.groundDepth(matrix, width: Double(size.width), height: Double(size.height)),
+                depthStep: Self.depthStep,
+                depthNudge: 0
+            )
             encoder.setDepthStencilState(shadowDepth)
             encoder.setVertexBuffer(shadowBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: length, index: 1)
-            encoder.setFragmentBytes(&uniforms, length: length, index: 1)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: shadowCount)
+            for (pipeline, nudge) in [(shadowDepthPipeline, Float(0)), (shadowPipeline, Self.depthStep / 2)] {
+                shadow.depthNudge = nudge
+                encoder.setRenderPipelineState(pipeline)
+                encoder.setFragmentBytes(&shadow, length: MemoryLayout<ShadowUniforms>.stride, index: 2)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: shadowCount)
+            }
         }
         encoder.setRenderPipelineState(wallPipeline)
         encoder.setDepthStencilState(wallDepth)
@@ -274,6 +301,35 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         return result
     }
 
+    /// Whole steps of the 32-bit float depth buffer near the ground's depth
+    /// (0.25–0.5, one unit 2⁻²⁵), so neighbouring levels never round together.
+    private static let depthStep = Float(pow(2.0, -22.0))
+
+    /// The window depth of the ground (z = 0) as a plane over the drawable's
+    /// pixels, depth = a·x + b·y + c, in the wall's near half of the depth range.
+    private static func groundDepth(_ m: [Double], width: Double, height: Double) -> SIMD4<Float> {
+        // Clip x, y, w of a ground point are A·(x, y, 1); its NDC z is then
+        // linear in NDC x, y, with the coefficients rowZ · A⁻¹.
+        let a = [m[0], m[4], m[12], m[1], m[5], m[13], m[3], m[7], m[15]]
+        let rowZ = [m[2], m[6], m[14]]
+        let det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6])
+            + a[2] * (a[3] * a[7] - a[4] * a[6])
+        guard abs(det) > 1e-30, width > 0, height > 0 else { return SIMD4(0, 0, 0.5, 0) }
+        let inv = [
+            (a[4] * a[8] - a[5] * a[7]) / det, (a[2] * a[7] - a[1] * a[8]) / det, (a[1] * a[5] - a[2] * a[4]) / det,
+            (a[5] * a[6] - a[3] * a[8]) / det, (a[0] * a[8] - a[2] * a[6]) / det, (a[2] * a[3] - a[0] * a[5]) / det,
+            (a[3] * a[7] - a[4] * a[6]) / det, (a[1] * a[6] - a[0] * a[7]) / det, (a[0] * a[4] - a[1] * a[3]) / det,
+        ]
+        let c = (0..<3).map { j in rowZ[0] * inv[j] + rowZ[1] * inv[3 + j] + rowZ[2] * inv[6 + j] }
+        // NDC from pixels (y down): x 2x/w − 1, y 1 − 2y/h; window depth: NDC z / 4 + 1/4.
+        return SIMD4(
+            Float(0.5 * c[0] / width),
+            Float(-0.5 * c[1] / height),
+            Float(0.25 * (c[2] - c[0] + c[1]) + 0.25),
+            0
+        )
+    }
+
     private func makeUniforms(_ context: MLNStyleLayerDrawingContext, matrix: [Double]) -> Uniforms {
         let zoom = context.zoomLevel
         let worldSize = Self.tileSize * pow(2.0, zoom)
@@ -339,6 +395,7 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         float u;
         float kind [[flat]];
         float surface [[flat]];
+        float3 world;
     };
 
     vertex Out wallVertex(uint vid [[vertex_id]],
@@ -358,6 +415,7 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         out.u = v.u;
         out.kind = v.kind;
         out.surface = v.surface;
+        out.world = float3(p, z);
         return out;
     }
 
@@ -414,6 +472,27 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         return c;
     }
 
+    // How much of this pixel lies past `edge` along `x`, which changes by `w`
+    // per pixel: a soft step one pixel wide, so the details painted on the
+    // wall don't stair-step (the map's Metal view has no multisampling).
+    float coverage(float x, float edge, float w) {
+        return clamp((x - edge) / max(w, 1e-6) + 0.5, 0.0, 1.0);
+    }
+
+    // The road's top lit by a low sun from the north-west (mercator y points
+    // south): stretches that climb towards it brighten, those that turn away
+    // darken, flat road stays as it was.
+    float3 lit(float3 c, float3 world) {
+        float3 n = cross(dfdx(world), dfdy(world));
+        float len = length(n);
+        if (len < 1e-12) return c;
+        n /= len;
+        if (n.z < 0.0) n = -n;
+        const float3 sun = normalize(float3(-0.6, -0.6, 1.0));
+        float shade = clamp(dot(n, sun) / sun.z, 0.7, 1.2);
+        return min(c * mix(1.0, shade, 0.6), float3(1.0));
+    }
+
     fragment float4 wallFragment(Out in [[stage_in]], constant Uniforms& U [[buffer(1)]]) {
         float hw = U.halfWidthM;
         float mpp = U.metersPerPx;
@@ -423,17 +502,24 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
             if (U.graphIntervalM > 0.0) {
                 float k = floor(in.u / U.graphIntervalM + 0.5);
                 float stripe = k * U.graphIntervalM;
-                if (k > 0.0 && stripe < U.totalM && abs(in.u - stripe) < mpp) c = mix(c, float3(1.0), 0.6);
+                if (k > 0.0 && stripe < U.totalM) c = mix(c, float3(1.0), 0.6 * coverage(-abs(in.u - stripe), -mpp, fwidth(in.u)));
             }
             return float4(c, 1.0);
         }
         float a = abs(in.across);
-        if (hw * 0.22 / mpp >= 0.5 && a > 0.78) return float4(0.078, 0.078, 0.078, 1.0);
+        float wa = fwidth(a);
         int surface = int(in.surface + 0.5);
         float3 c = road(surface, in.u, in.across * hw + hw, hw, mpp, U);
         bool isDashed = kind == 1 && (surface == 0 || surface == 2) && hw * 0.22 / mpp >= 0.5;
-        if (isDashed && a < 0.11 && fmod(in.u, 4.0 * hw) < 2.0 * hw) c = float3(0.969);
-        return float4(c, 1.0);
+        if (isDashed) {
+            // Measured along the road itself: the phase jumps at every dash.
+            float wu = fwidth(in.u);
+            float phase = fmod(in.u, 4.0 * hw);
+            float along = max(coverage(min(phase, 2.0 * hw - phase), 0.0, wu), coverage(phase, 4.0 * hw, wu));
+            c = mix(c, float3(0.969), along * (1.0 - coverage(a, 0.11, wa)));
+        }
+        if (hw * 0.22 / mpp >= 0.5) c = mix(c, float3(0.078), coverage(a, 0.78, wa));
+        return float4(lit(c, in.world), 1.0);
     }
 
     struct LabelOut {
@@ -453,10 +539,33 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         return image.sample(s, in.uv);
     }
 
-    fragment float4 shadowFragment(Out in [[stage_in]]) {
+    struct ShadowUniforms {
+        float4 groundDepth;
+        float depthStep;
+        float depthNudge;
+        float pad0;
+        float pad1;
+    };
+
+    struct ShadowOut {
+        float4 color [[color(0)]];
+        float depth [[depth(any)]];
+    };
+
+    // Where the shadow's strips overlap (inside a bend) each pixel must be
+    // shaded once, by the darkest strip. Their interpolated depths differ by
+    // rounding, so the depth comes from the ground plane under the pixel
+    // instead, the same for every strip, nudged nearer by the quantized
+    // darkness: a first pass keeps the darkest per pixel in the depth buffer,
+    // a second draws only that.
+    fragment ShadowOut shadowFragment(Out in [[stage_in]], constant ShadowUniforms& S [[buffer(2)]]) {
         float t = clamp((abs(in.across) / 5.0 - 0.2) / 0.8, 0.0, 1.0);
         float alpha = 0.4 * (1.0 - t * t * (3.0 - 2.0 * t));
-        return float4(0.0, 0.0, 0.0, alpha);
+        float level = floor(alpha * 64.0 + 0.5);
+        ShadowOut out;
+        out.depth = dot(S.groundDepth.xyz, float3(in.position.xy, 1.0)) - level * S.depthStep - S.depthNudge;
+        out.color = float4(0.0, 0.0, 0.0, alpha);
+        return out;
     }
     """
 }
