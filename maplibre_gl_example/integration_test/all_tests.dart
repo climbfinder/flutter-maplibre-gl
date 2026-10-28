@@ -17,6 +17,7 @@ import 'add_image_size_test.dart' as add_image_size;
 import 'ambient_cache_size_test.dart' as ambient_cache_size;
 import 'android_feature_drag_test.dart' as android_feature_drag;
 import 'android_tap_timing_test.dart' as android_tap_timing;
+import 'android_tracking_zoom_test.dart' as android_tracking_zoom;
 import 'annotations_test.dart' as annotations;
 import 'attribution_test.dart' as attribution;
 import 'camera_target_bounds_test.dart' as camera_target_bounds;
@@ -41,6 +42,7 @@ void main() {
   add_image_size.main();
   android_feature_drag.main();
   android_tap_timing.main();
+  android_tracking_zoom.main();
   annotations.main();
   attribution.main();
   camera_target_bounds.main();
