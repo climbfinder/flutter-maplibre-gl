@@ -29,6 +29,7 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
 
     private var interactiveFeatureLayerIds = Set<String>()
     private var addedShapesByLayer = [String: MLNShape]()
+    private var climbWallLayers = [String: ClimbWallStyleLayer]()
 
     // GPS pulse: start/stop location updates on a timer to save battery.
     private var locationPulseTimer: Timer?
@@ -1300,6 +1301,47 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
                 layer.maximumZoomLevel = Float(maxzoom)
             }
             mapView.style?.insertLayer(layer, below: belowLayer)
+            result(nil)
+
+        case "climbWall#set":
+            guard let arguments = methodCall.arguments as? [String: Any],
+                  let layerId = arguments["layerId"] as? String,
+                  let params = arguments["params"] as? [String: Any],
+                  let style = mapView.style
+            else {
+                result(nil)
+                return
+            }
+            let layer: ClimbWallStyleLayer
+            // A style reload drops the layer but not our handle to it.
+            if let existing = climbWallLayers[layerId], style.layer(withIdentifier: layerId) != nil {
+                layer = existing
+            } else {
+                if let stale = style.layer(withIdentifier: layerId) {
+                    style.removeLayer(stale)
+                }
+                layer = ClimbWallStyleLayer(identifier: layerId)
+                style.addLayer(layer)
+                climbWallLayers[layerId] = layer
+            }
+            layer.update(
+                wall: (arguments["wall"] as? FlutterStandardTypedData)?.data,
+                shadow: (arguments["shadow"] as? FlutterStandardTypedData)?.data,
+                params: params
+            )
+            result(nil)
+
+        case "climbWall#remove":
+            guard let arguments = methodCall.arguments as? [String: Any],
+                  let layerId = arguments["layerId"] as? String
+            else {
+                result(nil)
+                return
+            }
+            climbWallLayers.removeValue(forKey: layerId)
+            if let layer = mapView.style?.layer(withIdentifier: layerId) {
+                mapView.style?.removeLayer(layer)
+            }
             result(nil)
 
         case "style#removeLayer":
