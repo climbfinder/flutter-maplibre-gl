@@ -2346,7 +2346,12 @@ class MapLibreMapController extends ChangeNotifier {
     Float32List? shadow,
     required Map<String, Object> params,
   }) {
-    return _maplibrePlatform.setClimbWall(layerId, wall: wall, shadow: shadow, params: params);
+    return _maplibrePlatform.setClimbWall(
+      layerId,
+      wall: wall,
+      shadow: shadow,
+      params: params,
+    );
   }
 
   /// Climbfinder fork: see [MapLibrePlatform.removeClimbWall].

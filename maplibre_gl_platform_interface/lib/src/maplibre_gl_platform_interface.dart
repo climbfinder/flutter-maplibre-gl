@@ -492,11 +492,15 @@ abstract class MapLibrePlatform {
     Float32List? shadow,
     required Map<String, Object> params,
   }) {
-    throw UnimplementedError('setClimbWall() is only implemented on iOS and Android');
+    throw UnimplementedError(
+      'setClimbWall() is only implemented on iOS and Android',
+    );
   }
 
   Future<void> removeClimbWall(String layerId) {
-    throw UnimplementedError('removeClimbWall() is only implemented on iOS and Android');
+    throw UnimplementedError(
+      'removeClimbWall() is only implemented on iOS and Android',
+    );
   }
 
   /// Returns the visibility of a layer.
