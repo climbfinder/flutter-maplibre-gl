@@ -1381,6 +1381,28 @@ class MapLibreMethodChannel extends MapLibrePlatform {
   }
 
   @override
+  Future<void> setClimbWall(
+    String layerId, {
+    Float32List? wall,
+    Float32List? shadow,
+    required Map<String, Object> params,
+  }) async {
+    await _channel.invokeMethod('climbWall#set', <String, dynamic>{
+      'layerId': layerId,
+      if (wall != null) 'wall': wall,
+      if (shadow != null) 'shadow': shadow,
+      'params': params,
+    });
+  }
+
+  @override
+  Future<void> removeClimbWall(String layerId) async {
+    await _channel.invokeMethod('climbWall#remove', <String, dynamic>{
+      'layerId': layerId,
+    });
+  }
+
+  @override
   Future<void> setLayerVisibility(String layerId, bool visible) async {
     await _channel.invokeMethod('layer#setVisibility', <String, dynamic>{
       'layerId': layerId,

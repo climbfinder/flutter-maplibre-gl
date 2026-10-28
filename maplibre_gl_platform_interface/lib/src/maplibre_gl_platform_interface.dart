@@ -481,6 +481,24 @@ abstract class MapLibrePlatform {
 
   Future<void> setLayerVisibility(String layerId, bool visible);
 
+  /// Climbfinder fork: stands a climb's 3D wall on the map as a native custom
+  /// layer (Metal on iOS, OpenGL ES on Android) on top of every other layer.
+  /// Calling it again with the same [layerId] replaces the mesh; [params]
+  /// alone (no meshes) only updates the uniforms. See the app's
+  /// `ClimbWallMesh` for the vertex layout.
+  Future<void> setClimbWall(
+    String layerId, {
+    Float32List? wall,
+    Float32List? shadow,
+    required Map<String, Object> params,
+  }) {
+    throw UnimplementedError('setClimbWall() is only implemented on iOS and Android');
+  }
+
+  Future<void> removeClimbWall(String layerId) {
+    throw UnimplementedError('removeClimbWall() is only implemented on iOS and Android');
+  }
+
   /// Returns the visibility of a layer.
   /// Returns true if visible, false if hidden, null if layer not found.
   Future<bool?> getLayerVisibility(String layerId);
