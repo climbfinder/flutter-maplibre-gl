@@ -2339,6 +2339,26 @@ class MapLibreMapController extends ChangeNotifier {
     return _maplibrePlatform.setLayerVisibility(layerId, visible);
   }
 
+  /// Climbfinder fork: see [MapLibrePlatform.setClimbWall].
+  Future<void> setClimbWall(
+    String layerId, {
+    Float32List? wall,
+    Float32List? shadow,
+    required Map<String, Object> params,
+  }) {
+    return _maplibrePlatform.setClimbWall(
+      layerId,
+      wall: wall,
+      shadow: shadow,
+      params: params,
+    );
+  }
+
+  /// Climbfinder fork: see [MapLibrePlatform.removeClimbWall].
+  Future<void> removeClimbWall(String layerId) {
+    return _maplibrePlatform.removeClimbWall(layerId);
+  }
+
   Future<List> getLayerIds() {
     return _maplibrePlatform.getLayerIds();
   }
