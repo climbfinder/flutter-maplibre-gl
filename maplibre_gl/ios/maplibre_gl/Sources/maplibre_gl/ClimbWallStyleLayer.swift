@@ -541,10 +541,12 @@ struct ClimbWallLabelLayout {
         var body: [Float]
     }
 
+    /// A point on screen; `isValid` is false behind the camera.
     private struct Point {
-        let x: Double
-        let y: Double
-        let depth: Double
+        var x = 0.0
+        var y = 0.0
+        var depth = 0.0
+        var isValid = false
     }
 
     let matrix: [Double]
@@ -560,13 +562,12 @@ struct ClimbWallLabelLayout {
     func place(_ labels: [ClimbWallLabel]) -> [Placed] {
         let wallTop = maxElevation * exaggeration + 1 + riseM
         guard wallTop / metersPerPx >= Self.minWallPx else { return [] }
-        var corners: [[Point?]]?
+        var corners: ContiguousArray<Point>?
         var items: [(label: ClimbWallLabel, at: Point, covered: Double)] = []
         for label in labels {
             let z = label.elevation * exaggeration + 1 + riseM * label.fraction
-            guard let at = project(label.x, label.y, z),
-                  at.x >= 0, at.x <= width, at.y >= 0, at.y <= height
-            else { continue }
+            let at = project(label.x, label.y, z)
+            guard at.isValid, at.x >= 0, at.x <= width, at.y >= 0, at.y <= height else { continue }
             if corners == nil { corners = buildCorners() }
             if hides(corners!, distance: label.distance, at: at) { continue }
             items.append((label, at, 0))
@@ -620,43 +621,48 @@ struct ClimbWallLabelLayout {
         return [l, t, 0, vt, r, t, 1, vt, r, b, 1, vb, l, t, 0, vt, r, b, 1, vb, l, b, 0, vb]
     }
 
-    private func project(_ x: Double, _ y: Double, _ z: Double) -> Point? {
+    private func project(_ x: Double, _ y: Double, _ z: Double) -> Point {
         let m = matrix
         let cx = m[0] * x + m[4] * y + m[8] * z + m[12]
         let cy = m[1] * x + m[5] * y + m[9] * z + m[13]
         let w = m[3] * x + m[7] * y + m[11] * z + m[15]
-        guard w > 1e-9 else { return nil }
-        return Point(x: (cx / w + 1) / 2 * width, y: (1 - cy / w) / 2 * height, depth: w)
+        guard w > 1e-9 else { return Point() }
+        return Point(x: (cx / w + 1) / 2 * width, y: (1 - cy / w) / 2 * height, depth: w, isValid: true)
     }
 
-    /// Per top: the left and right foot, then the left and right top.
-    private func buildCorners() -> [[Point?]] {
+    /// Four per top: the left and right foot, then the left and right top.
+    private func buildCorners() -> ContiguousArray<Point> {
         let count = tops.count / Self.floatsPerTop
-        return (0..<count).map { k in
+        var corners = ContiguousArray<Point>()
+        corners.reserveCapacity(count * 4)
+        for k in 0..<count {
             let t = k * Self.floatsPerTop
             let cx = Double(tops[t]), cy = Double(tops[t + 1])
             let nx = Double(tops[t + 2]) * halfWidthM, ny = Double(tops[t + 3]) * halfWidthM
             let z = Double(tops[t + 4]) * exaggeration + 1 + riseM * Double(tops[t + 5])
-            return [
-                project(cx + nx, cy + ny, 0), project(cx - nx, cy - ny, 0),
-                project(cx + nx, cy + ny, z), project(cx - nx, cy - ny, z),
-            ]
+            corners.append(project(cx + nx, cy + ny, 0))
+            corners.append(project(cx - nx, cy - ny, 0))
+            corners.append(project(cx + nx, cy + ny, z))
+            corners.append(project(cx - nx, cy - ny, z))
         }
+        return corners
     }
 
     /// The web's `occludedAt`: a side or the top of a stretch of wall that
     /// isn't right next to the label stands in front of it.
-    private func hides(_ corners: [[Point?]], distance: Double, at: Point) -> Bool {
+    private func hides(_ corners: ContiguousArray<Point>, distance: Double, at: Point) -> Bool {
+        let count = corners.count / 4
         var near = 0
-        while near < corners.count - 2, Double(tops[(near + 1) * Self.floatsPerTop + 6]) <= distance {
+        while near < count - 2, Double(tops[(near + 1) * Self.floatsPerTop + 6]) <= distance {
             near += 1
         }
-        for i in 0..<max(0, corners.count - 1) where i < near - 1 || i > near + 1 {
-            let a = corners[i], b = corners[i + 1]
+        for i in 0..<max(0, count - 1) where i < near - 1 || i > near + 1 {
+            let a = i * 4, b = (i + 1) * 4
             // Most of the wall lies nowhere near the label on screen.
             var minX = at.x, maxX = at.x, minY = at.y, maxY = at.y
             var isNearer = false
-            for case let corner? in a + b {
+            for c in a..<(b + 4) where corners[c].isValid {
+                let corner = corners[c]
                 minX = min(minX, corner.x)
                 maxX = max(maxX, corner.x)
                 minY = min(minY, corner.y)
@@ -664,8 +670,9 @@ struct ClimbWallLabelLayout {
                 isNearer = isNearer || corner.depth < at.depth
             }
             if !isNearer || minX == at.x || maxX == at.x || minY == at.y || maxY == at.y { continue }
-            if quadHides(at, a[0], b[0], b[2], a[2]) || quadHides(at, a[1], b[1], b[3], a[3])
-                || quadHides(at, a[2], b[2], b[3], a[3])
+            if quadHides(at, corners[a], corners[b], corners[b + 2], corners[a + 2])
+                || quadHides(at, corners[a + 1], corners[b + 1], corners[b + 3], corners[a + 3])
+                || quadHides(at, corners[a + 2], corners[b + 2], corners[b + 3], corners[a + 3])
             {
                 return true
             }
@@ -673,12 +680,12 @@ struct ClimbWallLabelLayout {
         return false
     }
 
-    private func quadHides(_ at: Point, _ p: Point?, _ q: Point?, _ r: Point?, _ t: Point?) -> Bool {
+    private func quadHides(_ at: Point, _ p: Point, _ q: Point, _ r: Point, _ t: Point) -> Bool {
         triangleHides(at, p, q, r) || triangleHides(at, p, r, t)
     }
 
-    private func triangleHides(_ at: Point, _ p: Point?, _ q: Point?, _ r: Point?) -> Bool {
-        guard let p = p, let q = q, let r = r else { return false }
+    private func triangleHides(_ at: Point, _ p: Point, _ q: Point, _ r: Point) -> Bool {
+        guard p.isValid, q.isValid, r.isValid else { return false }
         let d1 = (q.x - p.x) * (at.y - p.y) - (q.y - p.y) * (at.x - p.x)
         let d2 = (r.x - q.x) * (at.y - q.y) - (r.y - q.y) * (at.x - q.x)
         let d3 = (p.x - r.x) * (at.y - r.y) - (p.y - r.y) * (at.x - r.x)
