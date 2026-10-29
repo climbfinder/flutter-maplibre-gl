@@ -25,8 +25,8 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         var riseM: Float
         var graphIntervalM: Float
         var totalM: Float
-        var pad0: Float = 0
-        var pad1: Float = 0
+        var patternHalfWidthM: Float
+        var patternMetersPerPx: Float
         var surface0: SIMD4<Float>
         var surface1: SIMD4<Float>
         var surface2: SIMD4<Float>
@@ -63,6 +63,8 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
     private var graphIntervalM = 0.0
     private var totalM = 0.0
     private var zoomStep = 0.1
+    /// Negative while the road's pattern follows the zoom.
+    private var patternZoom = -1.0
     private var halfWidthByZoom: [Float] = []
     private var riseByZoom: [Float] = []
     private var surfaceColors: [SIMD4<Float>] = Array(repeating: SIMD4(0.5, 0.5, 0.5, 1), count: 4)
@@ -92,6 +94,7 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         graphIntervalM = number("graphIntervalM") ?? graphIntervalM
         totalM = number("totalM") ?? totalM
         zoomStep = number("zoomStep") ?? zoomStep
+        patternZoom = number("patternZoom") ?? patternZoom
         halfWidthByZoom = floats("halfWidthByZoom") ?? halfWidthByZoom
         riseByZoom = floats("riseByZoom") ?? riseByZoom
         if let colors = floats("surfaceColors"), colors.count == 12 {
@@ -335,14 +338,18 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         let worldSize = Self.tileSize * pow(2.0, zoom)
         let columns = (0..<4).map { col in SIMD4<Float>((0..<4).map { Float(matrix[col * 4 + $0]) }) }
         let metersPerPx = Self.earthCircumferenceM * cos(latitude * .pi / 180) / worldSize
+        let halfWidthM = lookup(halfWidthByZoom, zoom)
+        let isPatternFrozen = patternZoom >= 0
         return Uniforms(
             matrix: simd_float4x4(columns: (columns[0], columns[1], columns[2], columns[3])),
-            halfWidthM: lookup(halfWidthByZoom, zoom),
+            halfWidthM: halfWidthM,
             metersPerPx: Float(metersPerPx),
             exaggeration: Float(exaggeration),
             riseM: lookup(riseByZoom, zoom),
             graphIntervalM: Float(graphIntervalM),
             totalM: Float(totalM),
+            patternHalfWidthM: isPatternFrozen ? lookup(halfWidthByZoom, patternZoom) : halfWidthM,
+            patternMetersPerPx: Float(isPatternFrozen ? metersPerPx * pow(2.0, zoom - patternZoom) : metersPerPx),
             surface0: surfaceColors[0],
             surface1: surfaceColors[1],
             surface2: surfaceColors[2],
@@ -383,8 +390,8 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         float riseM;
         float graphIntervalM;
         float totalM;
-        float pad0;
-        float pad1;
+        float patternHalfWidthM;
+        float patternMetersPerPx;
         float4 surfaceColors[4];
     };
 
@@ -426,10 +433,15 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         return float(h & 0xffffffu) / 16777216.0;
     }
 
-    float3 road(int surface, float x, float y, float hw, float mpp, constant Uniforms& U) {
+    // The pattern's scale (pw, pm) is the wall's own half width and meters
+    // per pixel, except during a flyover, when it is frozen at the flight's
+    // zoom: a pattern rescaled with every zoom step crawls along the road.
+    float3 road(int surface, float x, float y, float mpp, constant Uniforms& U) {
         float3 c = U.surfaceColors[surface].rgb;
+        float pw = U.patternHalfWidthM;
+        float pm = U.patternMetersPerPx;
         if (surface == 3) {
-            float cell = max(hw * 0.5, mpp * 4.0);
+            float cell = max(pw * 0.5, pm * 4.0);
             float row = floor(y / cell);
             float shift = fmod(row, 2.0) * 0.5;
             float fx = fract(x / cell + shift);
@@ -439,14 +451,14 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
             return c * (0.94 + 0.1 * hash(int(floor(x / cell + shift)), int(row), 7));
         }
         if (surface == 1) {
-            float cell = max(hw * 0.12, mpp * 1.4);
+            float cell = max(pw * 0.12, pm * 1.4);
             float h = hash(int(floor(x / cell)), int(floor(y / cell)), 0);
             if (h < 0.22) return c * 0.86;
             if (h > 0.9) return min(c * 1.06, float3(1.0));
             return c;
         }
         if (surface == 2) {
-            float cell = hw * 1.3;
+            float cell = pw * 1.3;
             int kx = int(floor(x / cell));
             int ky = int(floor(y / cell));
             float shade = 1.0;
@@ -457,7 +469,7 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
                     if (hash(k, r, 0) <= 0.55) continue;
                     float2 center = float2(float(k) + 0.5 + (hash(k, r, 3) - 0.5) * 0.6,
                                            float(r) + 0.5 + (hash(k, r, 9) - 0.5) * 0.6) * cell;
-                    float radius = (0.24 + 0.28 * hash(k, r, 5)) * hw;
+                    float radius = (0.24 + 0.28 * hash(k, r, 5)) * pw;
                     float2 d = float2(x, y) - center;
                     float angle = atan2(d.y, d.x);
                     float wobble = 1.0 + 0.18 * sin(angle * 3.0 + hash(k, r, 11) * 6.2832)
@@ -509,13 +521,14 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
         float a = abs(in.across);
         float wa = fwidth(a);
         int surface = int(in.surface + 0.5);
-        float3 c = road(surface, in.u, in.across * hw + hw, hw, mpp, U);
+        float3 c = road(surface, in.u, in.across * hw + hw, mpp, U);
         bool isDashed = kind == 1 && (surface == 0 || surface == 2) && hw * 0.22 / mpp >= 0.5;
         if (isDashed) {
             // Measured along the road itself: the phase jumps at every dash.
             float wu = fwidth(in.u);
-            float phase = fmod(in.u, 4.0 * hw);
-            float along = max(coverage(min(phase, 2.0 * hw - phase), 0.0, wu), coverage(phase, 4.0 * hw, wu));
+            float pw = U.patternHalfWidthM;
+            float phase = fmod(in.u, 4.0 * pw);
+            float along = max(coverage(min(phase, 2.0 * pw - phase), 0.0, wu), coverage(phase, 4.0 * pw, wu));
             c = mix(c, float3(0.969), along * (1.0 - coverage(a, 0.11, wa)));
         }
         if (hw * 0.22 / mpp >= 0.5) c = mix(c, float3(0.078), coverage(a, 0.78, wa));

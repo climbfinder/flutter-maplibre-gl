@@ -39,6 +39,7 @@ final class ClimbWallLayer {
         number(params, "graphIntervalM"),
         number(params, "totalM"),
         number(params, "zoomStep"),
+        params.get("patternZoom") instanceof Number ? number(params, "patternZoom") : -1,
         (float[]) params.get("halfWidthByZoom"),
         (float[]) params.get("riseByZoom"),
         (float[]) params.get("surfaceColors"));
@@ -94,6 +95,7 @@ final class ClimbWallLayer {
       double graphIntervalM,
       double totalM,
       double zoomStep,
+      double patternZoom,
       float[] halfWidthByZoom,
       float[] riseByZoom,
       float[] surfaceColors);
