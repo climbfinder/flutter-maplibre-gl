@@ -557,13 +557,15 @@ final class ClimbWallStyleLayer: MLNCustomStyleLayer {
     // rounding, so the depth comes from the ground plane under the pixel
     // instead, the same for every strip, nudged nearer by the quantized
     // darkness: a first pass keeps the darkest per pixel in the depth buffer,
-    // a second draws only that.
+    // a second draws only that. Every level stays behind the ground: nudged
+    // in front of it, the shadow hid the wall's foot, so the wall floated and
+    // its low start vanished.
     fragment ShadowOut shadowFragment(Out in [[stage_in]], constant ShadowUniforms& S [[buffer(2)]]) {
         float t = clamp((abs(in.across) / 5.0 - 0.2) / 0.8, 0.0, 1.0);
         float alpha = 0.4 * (1.0 - t * t * (3.0 - 2.0 * t));
         float level = floor(alpha * 64.0 + 0.5);
         ShadowOut out;
-        out.depth = dot(S.groundDepth.xyz, float3(in.position.xy, 1.0)) - level * S.depthStep - S.depthNudge;
+        out.depth = dot(S.groundDepth.xyz, float3(in.position.xy, 1.0)) + (65.0 - level) * S.depthStep - S.depthNudge;
         out.color = float4(0.0, 0.0, 0.0, alpha);
         return out;
     }

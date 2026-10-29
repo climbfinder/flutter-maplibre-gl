@@ -181,6 +181,8 @@ void main() {
 // so the depth comes from the ground plane under the pixel instead, the same
 // for every strip, nudged nearer by the quantized darkness: a first pass
 // keeps the darkest per pixel in the depth buffer, a second draws only that.
+// Every level stays behind the ground: nudged in front of it, the shadow hid
+// the wall's foot, so the wall floated and its low start vanished.
 const GLchar* kShadowFragmentShader = R"(#version 300 es
 precision highp float;
 uniform vec3 u_groundDepth;
@@ -192,7 +194,7 @@ void main() {
     float t = clamp((abs(v_across) / 5.0 - 0.2) / 0.8, 0.0, 1.0);
     float alpha = 0.4 * (1.0 - t * t * (3.0 - 2.0 * t));
     float level = floor(alpha * 64.0 + 0.5);
-    gl_FragDepth = dot(u_groundDepth, vec3(gl_FragCoord.xy, 1.0)) - level * u_depthStep - u_depthNudge;
+    gl_FragDepth = dot(u_groundDepth, vec3(gl_FragCoord.xy, 1.0)) + (65.0 - level) * u_depthStep - u_depthNudge;
     fragColor = vec4(0.0, 0.0, 0.0, alpha);
 }
 )";
