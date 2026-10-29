@@ -475,11 +475,11 @@ void groundDepth(const double* m, const GLint* viewport, GLfloat* out) {
     out[2] = static_cast<GLfloat>(0.25 * (c[2] - c[0] * (1 + 2 * viewport[0] / w) - c[1] * (1 + 2 * viewport[1] / h)) + 0.25);
 }
 
-class ClimbWallHost final : public mbgl::style::CustomLayerHost {
+class ClimbWallHost final : public mln::style::CustomLayerHost {
 public:
     explicit ClimbWallHost(std::shared_ptr<State> state) : state_(std::move(state)) {}
 
-    void initialize(const mbgl::style::CustomLayerInitParameters&) override {
+    void initialize(const mln::style::CustomLayerInitParameters&) override {
         program_ = glCreateProgram();
         vertexShader_ = compile(GL_VERTEX_SHADER, kVertexShader);
         fragmentShader_ = compile(GL_FRAGMENT_SHADER, kFragmentShader);
@@ -554,7 +554,7 @@ public:
         state_->isMeshDirty = true;
     }
 
-    void render(const mbgl::style::CustomLayerRenderParameters& parameters) override {
+    void render(const mln::style::CustomLayerRenderParameters& parameters) override {
         if (!program_) return;
         Params params;
         std::lock_guard<std::mutex> lock(state_->mutex);
@@ -762,7 +762,7 @@ JNIEXPORT jlong JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeCreate
 // MapLibre's CustomLayer takes ownership of the host.
 JNIEXPORT jlong JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeCreateHost(JNIEnv*, jclass, jlong state) {
     auto* host = new ClimbWallHost(handle(state));
-    return reinterpret_cast<jlong>(static_cast<mbgl::style::CustomLayerHost*>(host));
+    return reinterpret_cast<jlong>(static_cast<mln::style::CustomLayerHost*>(host));
 }
 
 JNIEXPORT void JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeSetMesh(JNIEnv* env, jclass, jlong state,

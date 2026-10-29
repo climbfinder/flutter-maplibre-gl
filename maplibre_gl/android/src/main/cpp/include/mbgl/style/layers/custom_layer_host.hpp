@@ -1,6 +1,6 @@
 #pragma once
 
-// Climbfinder fork: the custom layer interface of MapLibre Native android-v13.5.0
+// Climbfinder fork: the custom layer interface of MapLibre Native android-v13.5.3
 // (include/mbgl/style/layers/custom_layer_host.hpp and the parameter structs it
 // pulls in), vendored because the AAR ships no headers. The host is handed to
 // libmaplibre.so as a raw pointer and called through its vtable, so the order
@@ -9,7 +9,7 @@
 
 #include <array>
 
-namespace mbgl {
+namespace mln {
 
 namespace gfx {
 class Context;
@@ -38,11 +38,11 @@ class CustomLayerHost {
 public:
     virtual ~CustomLayerHost() = default;
     virtual void initialize(const CustomLayerInitParameters&) = 0;
-    virtual void preRender(const mbgl::gfx::Context&, const CustomLayerRenderParameters&) {}
+    virtual void preRender(const mln::gfx::Context&, const CustomLayerRenderParameters&) {}
     virtual void render(const CustomLayerRenderParameters&) = 0;
     virtual void contextLost() = 0;
     virtual void deinitialize() = 0;
 };
 
 } // namespace style
-} // namespace mbgl
+} // namespace mln
