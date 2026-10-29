@@ -62,6 +62,8 @@ precision highp float;
 precision highp int;
 uniform float u_halfWidthM;
 uniform float u_metersPerPx;
+uniform float u_patternHalfWidthM;
+uniform float u_patternMetersPerPx;
 uniform float u_graphIntervalM;
 uniform float u_totalM;
 uniform vec3 u_surfaceColors[4];
@@ -101,10 +103,13 @@ float hash(int x, int y, int salt) {
     return float(h & 0xffffffu) / 16777216.0;
 }
 
-vec3 road(int surface, float x, float y, float hw, float mpp) {
+// The pattern's scale (pw, pm) is the wall's own half width and meters per
+// pixel, except during a flyover, when it is frozen at the flight's zoom: a
+// pattern rescaled with every zoom step crawls along the road.
+vec3 road(int surface, float x, float y, float mpp, float pw, float pm) {
     vec3 c = u_surfaceColors[surface];
     if (surface == 3) {
-        float cell = max(hw * 0.5, mpp * 4.0);
+        float cell = max(pw * 0.5, pm * 4.0);
         float row = floor(y / cell);
         float shift = mod(row, 2.0) * 0.5;
         float fx = fract(x / cell + shift);
@@ -114,14 +119,14 @@ vec3 road(int surface, float x, float y, float hw, float mpp) {
         return c * (0.94 + 0.1 * hash(int(floor(x / cell + shift)), int(row), 7));
     }
     if (surface == 1) {
-        float cell = max(hw * 0.12, mpp * 1.4);
+        float cell = max(pw * 0.12, pm * 1.4);
         float h = hash(int(floor(x / cell)), int(floor(y / cell)), 0);
         if (h < 0.22) return c * 0.86;
         if (h > 0.9) return min(c * 1.06, vec3(1.0));
         return c;
     }
     if (surface == 2) {
-        float cell = hw * 1.3;
+        float cell = pw * 1.3;
         int kx = int(floor(x / cell));
         int ky = int(floor(y / cell));
         float shade = 1.0;
@@ -131,7 +136,7 @@ vec3 road(int surface, float x, float y, float hw, float mpp) {
                 int r = ky + dy;
                 if (hash(k, r, 0) <= 0.55) continue;
                 vec2 center = vec2(float(k) + 0.5 + (hash(k, r, 3) - 0.5) * 0.6, float(r) + 0.5 + (hash(k, r, 9) - 0.5) * 0.6) * cell;
-                float radius = (0.24 + 0.28 * hash(k, r, 5)) * hw;
+                float radius = (0.24 + 0.28 * hash(k, r, 5)) * pw;
                 vec2 d = vec2(x, y) - center;
                 float angle = atan(d.y, d.x);
                 float wobble = 1.0 + 0.18 * sin(angle * 3.0 + hash(k, r, 11) * 6.2832) + 0.1 * sin(angle * 5.0 + hash(k, r, 17) * 6.2832);
@@ -148,6 +153,7 @@ vec3 road(int surface, float x, float y, float hw, float mpp) {
 void main() {
     float hw = u_halfWidthM;
     float mpp = u_metersPerPx;
+    float pw = u_patternHalfWidthM;
     int kind = int(v_kind + 0.5);
     if (kind == 0) {
         vec3 c = v_color;
@@ -162,13 +168,13 @@ void main() {
     float a = abs(v_across);
     float wa = fwidth(a);
     int surface = int(v_surface + 0.5);
-    vec3 c = road(surface, v_u, v_across * hw + hw, hw, mpp);
+    vec3 c = road(surface, v_u, v_across * hw + hw, mpp, pw, u_patternMetersPerPx);
     bool isDashed = kind == 1 && (surface == 0 || surface == 2) && hw * 0.22 / mpp >= 0.5;
     if (isDashed) {
         // Measured along the road itself: the phase jumps at every dash.
         float wu = fwidth(v_u);
-        float phase = mod(v_u, 4.0 * hw);
-        float along = max(coverage(min(phase, 2.0 * hw - phase), 0.0, wu), coverage(phase, 4.0 * hw, wu));
+        float phase = mod(v_u, 4.0 * pw);
+        float along = max(coverage(min(phase, 2.0 * pw - phase), 0.0, wu), coverage(phase, 4.0 * pw, wu));
         c = mix(c, vec3(0.969), along * (1.0 - coverage(a, 0.11, wa)));
     }
     if (hw * 0.22 / mpp >= 0.5) c = mix(c, vec3(0.078), coverage(a, 0.78, wa));
@@ -406,6 +412,8 @@ struct Params {
     double graphIntervalM = 0;
     double totalM = 0;
     double zoomStep = 0.1;
+    // Negative while the road's pattern follows the zoom.
+    double patternZoom = -1;
     std::vector<float> halfWidthByZoom;
     std::vector<float> riseByZoom;
     std::vector<float> surfaceColors = std::vector<float>(12, 0.5f);
@@ -498,6 +506,8 @@ public:
         uExaggeration_ = glGetUniformLocation(program_, "u_exaggeration");
         uRise_ = glGetUniformLocation(program_, "u_riseM");
         uMetersPerPx_ = glGetUniformLocation(program_, "u_metersPerPx");
+        uPatternHalfWidth_ = glGetUniformLocation(program_, "u_patternHalfWidthM");
+        uPatternMetersPerPx_ = glGetUniformLocation(program_, "u_patternMetersPerPx");
         uGraphInterval_ = glGetUniformLocation(program_, "u_graphIntervalM");
         uTotal_ = glGetUniformLocation(program_, "u_totalM");
         uSurfaceColors_ = glGetUniformLocation(program_, "u_surfaceColors");
@@ -589,6 +599,11 @@ public:
         const double metersPerPx = kEarthCircumferenceM * std::cos(params.latitude * M_PI / 180.0) / worldSize;
 
         const float halfWidthM = lookup(params.halfWidthByZoom, parameters.zoom, params.zoomStep);
+        const bool isPatternFrozen = params.patternZoom >= 0;
+        const float patternHalfWidthM =
+            isPatternFrozen ? lookup(params.halfWidthByZoom, params.patternZoom, params.zoomStep) : halfWidthM;
+        const double patternMetersPerPx =
+            isPatternFrozen ? metersPerPx * std::pow(2.0, parameters.zoom - params.patternZoom) : metersPerPx;
         const float riseM = lookup(params.riseByZoom, parameters.zoom, params.zoomStep);
         glDisable(GL_STENCIL_TEST);
         glDisable(GL_CULL_FACE);
@@ -630,6 +645,8 @@ public:
         glUniform1f(uExaggeration_, static_cast<float>(params.exaggeration));
         glUniform1f(uRise_, riseM);
         glUniform1f(uMetersPerPx_, static_cast<float>(metersPerPx));
+        glUniform1f(uPatternHalfWidth_, patternHalfWidthM);
+        glUniform1f(uPatternMetersPerPx_, static_cast<float>(patternMetersPerPx));
         glUniform1f(uGraphInterval_, static_cast<float>(params.graphIntervalM));
         glUniform1f(uTotal_, static_cast<float>(params.totalM));
         glUniform3fv(uSurfaceColors_, 4, params.surfaceColors.data());
@@ -730,6 +747,7 @@ private:
     GLsizei shadowCount_ = 0;
     GLint uMatrix_ = -1, uHalfWidth_ = -1, uExaggeration_ = -1, uRise_ = -1;
     GLint uMetersPerPx_ = -1, uGraphInterval_ = -1, uTotal_ = -1, uSurfaceColors_ = -1;
+    GLint uPatternHalfWidth_ = -1, uPatternMetersPerPx_ = -1;
     GLuint shadowProgram_ = 0, shadowFragmentShader_ = 0;
     GLint uShadowMatrix_ = -1, uShadowHalfWidth_ = -1, uShadowExaggeration_ = -1, uShadowRise_ = -1;
     GLint uGroundDepth_ = -1, uDepthStep_ = -1, uDepthNudge_ = -1;
@@ -778,8 +796,8 @@ JNIEXPORT void JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeSetMesh
 
 JNIEXPORT void JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeSetParams(
     JNIEnv* env, jclass, jlong state, jdouble originX, jdouble originY, jdouble latitude,
-    jdouble exaggeration, jdouble graphIntervalM, jdouble totalM, jdouble zoomStep, jfloatArray halfWidthByZoom,
-    jfloatArray riseByZoom, jfloatArray surfaceColors) {
+    jdouble exaggeration, jdouble graphIntervalM, jdouble totalM, jdouble zoomStep, jdouble patternZoom,
+    jfloatArray halfWidthByZoom, jfloatArray riseByZoom, jfloatArray surfaceColors) {
     Params params;
     params.originX = originX;
     params.originY = originY;
@@ -788,6 +806,7 @@ JNIEXPORT void JNICALL Java_org_maplibre_maplibregl_ClimbWallLayer_nativeSetPara
     params.graphIntervalM = graphIntervalM;
     params.totalM = totalM;
     params.zoomStep = zoomStep > 0 ? zoomStep : 0.1;
+    params.patternZoom = patternZoom;
     params.halfWidthByZoom = floats(env, halfWidthByZoom);
     params.riseByZoom = floats(env, riseByZoom);
     auto colors = floats(env, surfaceColors);
