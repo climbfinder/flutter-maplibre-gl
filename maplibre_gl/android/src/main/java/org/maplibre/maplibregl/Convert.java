@@ -249,7 +249,10 @@ class Convert {
       return values;
     }
     if (json.isJsonNull()) {
-      return null;
+      // The engine takes any null in the array for an array and aborts the app
+      // in JNI (GetArrayLength on null). An empty string is what
+      // Expression.Converter made of a null, so expressions behave as before.
+      return "";
     }
     JsonPrimitive primitive = json.getAsJsonPrimitive();
     if (primitive.isBoolean()) {
