@@ -30,6 +30,17 @@ class ExactExpressionTest {
         assertArrayEquals(arrayOf<Any?>("literal", "#f00"), circleProperty("circle-color", "#f00"))
     }
 
+    // Climbfinder fork: the engine aborts the app in JNI on a null in the array.
+    @Test
+    fun aNullLiteralBecomesAnEmptyStringAsExpressionConverterMadeIt() {
+        val noScore = listOf("case", listOf("==", listOf("get", "cotacol"), null), "#fff", "#f00")
+
+        assertArrayEquals(
+            arrayOf<Any?>("case", arrayOf<Any?>("==", arrayOf<Any?>("get", "cotacol"), ""), "#fff", "#f00"),
+            circleProperty("circle-color", noScore),
+        )
+    }
+
     @Test
     fun withinAndDistanceGetTheirGeoJsonAsText() {
         val ring = listOf(listOf(0, 0), listOf(1, 0), listOf(0, 1), listOf(0, 0))
