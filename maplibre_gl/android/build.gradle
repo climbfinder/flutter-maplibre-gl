@@ -58,6 +58,14 @@ android {
 
     ndkVersion "28.2.13676358"
 
+    // Climbfinder fork: the climb wall's custom layer (src/main/cpp). It draws with
+    // OpenGL ES, so maplibre_gl.renderer has to stay opengl.
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+        }
+    }
+
     defaultConfig {
         minSdkVersion 24
         compileSdk 36
