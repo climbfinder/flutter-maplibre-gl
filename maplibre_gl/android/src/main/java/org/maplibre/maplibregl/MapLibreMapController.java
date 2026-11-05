@@ -179,6 +179,7 @@ final class MapLibreMapController
 
   private final int id;
   private final BinaryMessenger messenger;
+  private final ClimbWallChannel climbWallChannel;
   /** Sends the events of this map to Dart. */
   private final MapLibreMapFlutterApi flutterApi;
   private final MapLibreMapsPlugin.LifecycleProvider lifecycleProvider;
@@ -367,6 +368,18 @@ final class MapLibreMapController
     this.messenger = messenger;
     this.flutterApi = new MapLibreMapFlutterApi(messenger, String.valueOf(id));
     MapLibreMapHostApi.Companion.setUp(messenger, new MapHostApi(this), String.valueOf(id));
+    this.climbWallChannel = new ClimbWallChannel(messenger, id, this);
+  }
+
+  /** Climbfinder fork: the style the climb wall goes on, null until it is fully loaded. */
+  @Nullable
+  Style climbWallStyle() {
+    return style != null && style.isFullyLoaded() ? style : null;
+  }
+
+  @Nullable
+  MapLibreMap climbWallMap() {
+    return mapLibreMap;
   }
 
   @Override
@@ -4301,6 +4314,7 @@ final class MapLibreMapController
     disposed = true;
     cancelSnapshot("MAP_DISPOSED", "The map was disposed before the snapshot was ready.");
     MapLibreMapHostApi.Companion.setUp(messenger, null, String.valueOf(id));
+    climbWallChannel.dispose();
     // A mapWaitForMap call parked while the map was still being built is only ever
     // answered by onMapReady, which will not fire now. Answer it here, or the Dart
     // side keeps awaiting initPlatform: onMapCreated never fires and everything

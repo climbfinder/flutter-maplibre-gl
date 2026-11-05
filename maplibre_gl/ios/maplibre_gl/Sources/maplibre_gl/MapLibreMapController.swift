@@ -16,6 +16,8 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     private let hostApi = MapHostApi()
     /// Sends this map's events to Dart.
     private let eventApi: MapLibreMapFlutterApi
+    /// Climbfinder fork: the climb wall's calls, on a channel of their own.
+    private var climbWallChannel: ClimbWallChannel?
     /// `eventApi` while this map holds its channels: after a hot restart a
     /// newer map with the same view id takes them over, and this one's late
     /// events would reach it.
@@ -175,6 +177,9 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
         ))
         // Leaves the handlers alone if a newer map with the same view id
         // already took the channels over, as after a hot restart.
+        if hostApi.ownsChannels(binaryMessenger: binaryMessenger, messageChannelSuffix: channelSuffix) {
+            climbWallChannel?.unregister()
+        }
         hostApi.unregister(binaryMessenger: binaryMessenger, messageChannelSuffix: channelSuffix)
         mapView.delegate = nil
         if let recognizers = mapView.gestureRecognizers {
@@ -255,6 +260,10 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
 
         hostApi.controller = self
         hostApi.register(binaryMessenger: binaryMessenger, messageChannelSuffix: channelSuffix)
+        climbWallChannel = ClimbWallChannel(binaryMessenger: messenger, suffix: suffix) { [weak self] in
+            guard let self, self.styleIsReady else { return nil }
+            return self.mapView.style
+        }
 
         mapView.delegate = self
         (mapView as? LocationPuckMapView)?.onTintColorDidChange = { [weak self] in
